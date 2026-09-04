@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Corpus maps (large, licensed under Blizzard AI/ML EULA + AI Arena) - do not commit
+gold_maps/*.SC2Map
+gold_maps/_zips/
+gold_maps/_extract/
+gold_maps/_modern/
+
+# Generated dataset / spike outputs
+dataset/
+outputs/
