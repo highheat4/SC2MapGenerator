@@ -1,5 +1,6 @@
 # SC2 Map Generator V1 - ingestion pipeline (Option B: engine dump)
 burnysc2>=6.5.0      # maintained python-sc2 fork; import name is `sc2`
 numpy>=1.24
+scipy>=1.10          # distance transform (path widths) + connected-component labeling
 matplotlib>=3.7
 Pillow>=10.0

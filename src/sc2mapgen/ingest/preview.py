@@ -56,6 +56,18 @@ def render(mapir: MapIR, out_path: str | Path) -> Path:
     # origin lower: SC2 (0,0) is bottom-left; array row 0 is y=0
     ax.imshow(rgb, origin="lower", interpolation="nearest")
 
+    # region/connection graph overlay: region centroids + ramp connections as edges
+    region_centroid = {rg.id: rg.centroid for rg in mapir.regions}
+    for conn in mapir.connections:
+        a = region_centroid.get(conn.source_region)
+        b = region_centroid.get(conn.target_region)
+        if a and b:
+            ax.plot([a[0], b[0]], [a[1], b[1]], "-", color="#ff2fd0", lw=1.2, alpha=0.8, zorder=3)
+    if mapir.regions:
+        rx = [rg.centroid[0] for rg in mapir.regions]
+        ry = [rg.centroid[1] for rg in mapir.regions]
+        ax.scatter(rx, ry, c="#ff2fd0", s=22, marker="D", edgecolors="black", linewidths=0.4, zorder=4)
+
     # resources
     def scatter(kind, color, marker, size):
         pts = [(r.x, r.y) for r in mapir.resources if r.kind == kind]

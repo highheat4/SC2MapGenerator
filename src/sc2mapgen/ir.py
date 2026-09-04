@@ -68,11 +68,48 @@ class BaseNode:
 
 @dataclass
 class Ramp:
-    """A pathable elevation transition. Stored as its cell footprint + endpoints."""
+    """A pathable elevation transition (python-sc2 style: pathable, non-buildable,
+    with local height variation - distinguishing it from a flat vision blocker)."""
 
     cells: list[tuple[int, int]] = field(default_factory=list)
     top: tuple[float, float] | None = None
     bottom: tuple[float, float] | None = None
+    low_level: int | None = None
+    high_level: int | None = None
+    width: float | None = None  # approx tiles across (size / length)
+
+
+@dataclass
+class Region:
+    """A plateau: a connected patch of walkable, non-ramp ground at ~constant elevation.
+
+    Ramps are excluded from region cells and instead become Connections between regions,
+    which yields a clean elevation-topology graph.
+    """
+
+    id: int
+    level: int
+    area: int  # cells
+    centroid: tuple[float, float]
+
+
+@dataclass
+class Connection:
+    """An edge of the semantic graph between two regions.
+
+    V1 connections come from ramps (ground links across an elevation change). Fields
+    mirror the design's Connection type; curvature is deferred (paths within a single
+    ramp are short/straight) and defaults to 1.0.
+    """
+
+    source_region: int
+    target_region: int
+    kind: str  # "ramp"
+    path_length: float
+    minimum_width: float
+    mean_width: float
+    curvature: float
+    elevation_changes: int
 
 
 @dataclass
@@ -125,6 +162,8 @@ class MapIR:
     bases: list[BaseNode]
     resources: list[Resource]
     ramps: list[Ramp]
+    regions: list[Region]
+    connections: list[Connection]
 
     start_locations: list[tuple[float, float]]
 
@@ -161,9 +200,21 @@ class MapIR:
                 for r in self.resources
             ],
             "ramps": [
-                {"top": r.top, "bottom": r.bottom, "num_cells": len(r.cells)}
+                {
+                    "top": r.top,
+                    "bottom": r.bottom,
+                    "num_cells": len(r.cells),
+                    "low_level": r.low_level,
+                    "high_level": r.high_level,
+                    "width": r.width,
+                }
                 for r in self.ramps
             ],
+            "regions": [
+                {"id": rg.id, "level": rg.level, "area": rg.area, "centroid": rg.centroid}
+                for rg in self.regions
+            ],
+            "connections": [asdict(c) for c in self.connections],
             "start_locations": self.start_locations,
         }
 

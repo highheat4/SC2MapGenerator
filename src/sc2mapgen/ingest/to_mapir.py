@@ -12,11 +12,16 @@ from pathlib import Path
 
 import numpy as np
 
+from sc2mapgen.ingest.graph import (
+    build_connections,
+    build_ramps,
+    build_regions,
+    find_ramp_cells,
+)
 from sc2mapgen.ir import (
     BaseKind,
     BaseNode,
     MapIR,
-    Ramp,
     Rect,
     Resource,
     ResourceKind,
@@ -26,31 +31,6 @@ from sc2mapgen.ir import (
 def _real_height(height_u8: np.ndarray) -> np.ndarray:
     """SC2 encodes terrain height as uint8; convert to real world units."""
     return -16.0 + height_u8.astype(np.float64) / 255.0 * 32.0
-
-
-def _connected_components(mask: np.ndarray, min_size: int = 10) -> list[list[tuple[int, int]]]:
-    """4-connectivity flood-fill labeling over a boolean mask. Returns cell lists (x, y)."""
-    visited = np.zeros_like(mask, dtype=bool)
-    comps: list[list[tuple[int, int]]] = []
-    h, w = mask.shape
-    for sy in range(h):
-        for sx in range(w):
-            if not mask[sy, sx] or visited[sy, sx]:
-                continue
-            stack = [(sy, sx)]
-            visited[sy, sx] = True
-            cells: list[tuple[int, int]] = []
-            while stack:
-                y, x = stack.pop()
-                cells.append((x, y))
-                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        stack.append((ny, nx))
-            if len(cells) >= min_size:
-                comps.append(cells)
-    return comps
 
 
 def _nearest(pt: tuple[float, float], candidates: list[tuple[float, float]]) -> int:
@@ -130,32 +110,13 @@ def build_mapir(dump_dir: str | Path) -> MapIR:
         res_idx = [ri for ri, b in enumerate(base_of_resource) if b == bi]
         bases.append(BaseNode(kind=kinds[bi], x=ex, y=ey, resource_idx=res_idx))
 
-    # --- ramps: pathable but not buildable, minus resource footprints ---
-    ramp_mask = walkable & ~buildable
-    # knock out cells right under destructibles/resources to reduce false positives
-    for r in resources:
-        rx, ry = int(round(r.x)), int(round(r.y))
-        y0, y1 = max(0, ry - 2), min(ramp_mask.shape[0], ry + 3)
-        x0, x1 = max(0, rx - 2), min(ramp_mask.shape[1], rx + 3)
-        ramp_mask[y0:y1, x0:x1] = False
-
-    ramps: list[Ramp] = []
-    for cells in _connected_components(ramp_mask, min_size=12):
-        ys = [c[1] for c in cells]
-        xs = [c[0] for c in cells]
-        # split endpoints by elevation extremes within the component
-        levels = [int(elevation[y, x]) for x, y in cells]
-        lo_i = int(np.argmin(levels))
-        hi_i = int(np.argmax(levels))
-        ramps.append(
-            Ramp(
-                cells=cells,
-                bottom=(float(cells[lo_i][0]), float(cells[lo_i][1])),
-                top=(float(cells[hi_i][0]), float(cells[hi_i][1])),
-            )
-        )
-
+    # --- ramps + region/connection graph (python-sc2 style detection) ---
     pa = meta["playable_area"]
+    ramp_mask, _vision_mask = find_ramp_cells(pathing, placement, height_u8, pa)
+    ramps, _ramp_labels = build_ramps(ramp_mask, elevation)
+    regions, region_labels = build_regions(walkable, ramp_mask, elevation)
+    connections = build_connections(ramps, region_labels)
+
     return MapIR(
         map_name=meta["map_name"],
         width=meta["width"],
@@ -167,5 +128,7 @@ def build_mapir(dump_dir: str | Path) -> MapIR:
         bases=bases,
         resources=resources,
         ramps=ramps,
+        regions=regions,
+        connections=connections,
         start_locations=[tuple(s) for s in starts],
     )
