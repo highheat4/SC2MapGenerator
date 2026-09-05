@@ -12,6 +12,7 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
+from scipy import ndimage
 
 from sc2mapgen.ingest.graph import clearance, path_metrics
 from sc2mapgen.ir import BaseKind, MapIR, ResourceKind
@@ -87,6 +88,17 @@ def extract_features(m: MapIR) -> dict:
 
     # --- ground distances & path widths (pathfinding) ---
     edt = clearance(walkable)
+    # Neutralize clearance within a disk around every base center: a base's own mineral
+    # line / townhall footprint sits at clearance ~1 and would otherwise cap every route's
+    # bottleneck at width 2. We want the choke of the corridor *between* bases.
+    edt_paths = edt.copy()
+    h_, w_ = edt.shape
+    R = 6
+    yy, xx = np.ogrid[:h_, :w_]
+    for b in m.bases:
+        disk = (xx - b.x) ** 2 + (yy - b.y) ** 2 <= R * R
+        edt_paths[disk] = np.inf
+    edt = edt_paths
     cache: dict = {}
 
     def pos(b):
@@ -125,10 +137,23 @@ def extract_features(m: MapIR) -> dict:
             bb_len.append(pm["path_length"])
     f.update(_summ("base_to_base", bb_len))
 
-    # --- symmetry QC: 180-degree rotational match about the PLAYABLE-AREA center ---
-    # (SC2 maps are symmetric about the playable center, which is offset from the grid
-    # center, so we crop to the playable sub-grid before rotating.)
+    # --- symmetry QC ---
+    # Competitive maps use different symmetry types: 180-degree rotational (point) OR
+    # reflection (mirror) across a horizontal/vertical axis. We score each transform on
+    # the playable sub-grid and keep the best, recording the detected type.
     sub = walkable[pa.y : pa.y + pa.height, pa.x : pa.x + pa.width]
-    f["rot180_symmetry"] = round(float((sub == np.flip(sub)).mean()), 3)
+    sym_scores = {
+        "rot180": float((sub == np.flip(sub)).mean()),
+        "mirror_lr": float((sub == np.flip(sub, axis=1)).mean()),
+        "mirror_ud": float((sub == np.flip(sub, axis=0)).mean()),
+    }
+    # diagonal (reflection across a diagonal) requires a square playable area
+    if sub.shape[0] == sub.shape[1]:
+        sym_scores["diagonal"] = float((sub == sub.T).mean())
+        sym_scores["antidiagonal"] = float((sub == np.flip(np.flip(sub, 0), 1).T).mean())
+    best_type = max(sym_scores, key=sym_scores.get)
+    f["rot180_symmetry"] = round(sym_scores["rot180"], 3)
+    f["symmetry_score"] = round(sym_scores[best_type], 3)
+    f["symmetry_type"] = best_type
 
     return f

@@ -35,6 +35,9 @@ from sc2mapgen.ingest.to_mapir import build_mapir
 
 DATASET = Path("dataset")
 
+# Non-competitive Melee test maps (empty/flat, no expansions) - excluded from the corpus.
+EXCLUDE = {"Empty128", "Flat32", "Flat48", "Flat64", "Flat96", "Flat128"}
+
 # curated features to plot as distributions
 KEY_FEATURES = [
     "width",
@@ -48,7 +51,7 @@ KEY_FEATURES = [
     "n_ramps",
     "n_regions",
     "high_ground_ratio",
-    "rot180_symmetry",
+    "symmetry_score",
 ]
 
 
@@ -76,7 +79,9 @@ def main() -> None:
     if args.maps:
         dirs = [DATASET / n for n in args.maps]
     else:
-        dirs = sorted(p.parent for p in DATASET.glob("*/_raw.npz"))
+        dirs = sorted(
+            p.parent for p in DATASET.glob("*/_raw.npz") if p.parent.name not in EXCLUDE
+        )
 
     rows: list[dict] = []
     for d in dirs:
@@ -104,9 +109,22 @@ def main() -> None:
         wr.writeheader()
         wr.writerows(rows)
 
-    # distributions
-    numeric_keys = [k for k in cols if k != "map_name"]
-    dist = {k: summarize([r.get(k) for r in rows]) for k in numeric_keys}
+    # distributions (numeric columns only; categorical get value counts)
+    def is_num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    numeric_keys = [
+        k for k in cols if k != "map_name" and any(is_num(r.get(k)) for r in rows)
+    ]
+    categorical_keys = [
+        k for k in cols if k != "map_name" and k not in numeric_keys
+    ]
+    dist = {k: summarize([r.get(k) for r in rows if is_num(r.get(k))]) for k in numeric_keys}
+    for k in categorical_keys:
+        counts: dict = {}
+        for r in rows:
+            counts[r.get(k)] = counts.get(r.get(k), 0) + 1
+        dist[k] = {"counts": counts}
     (DATASET / "_distributions.json").write_text(json.dumps(dist, indent=2))
 
     # plot key distributions

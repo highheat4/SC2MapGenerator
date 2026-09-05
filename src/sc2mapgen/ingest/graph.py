@@ -201,6 +201,34 @@ def dijkstra(walkable: np.ndarray, src: tuple[int, int]) -> tuple[np.ndarray, np
     return dist, pred
 
 
+def bottleneck_from(walkable: np.ndarray, edt: np.ndarray, src: tuple[int, int]) -> np.ndarray:
+    """Widest-path (maximin) clearance from src to every cell.
+
+    best[cell] = max over paths of (min clearance along the path). The value at a target
+    is the clearance of the *narrowest* point on the *widest* corridor connecting them -
+    i.e. the true choke you must pass through. width = 2 * best.
+    """
+    h, w = walkable.shape
+    best = np.zeros((h, w), dtype=np.float64)
+    sx, sy = src
+    best[sy, sx] = edt[sy, sx]
+    # max-heap via negative keys
+    pq: list[tuple[float, int, int]] = [(-edt[sy, sx], sx, sy)]
+    while pq:
+        neg_b, x, y = heapq.heappop(pq)
+        b = -neg_b
+        if b < best[y, x]:
+            continue
+        for dx, dy, _cost in _NEI:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < w and 0 <= ny < h and walkable[ny, nx]:
+                nb = min(b, edt[ny, nx])
+                if nb > best[ny, nx]:
+                    best[ny, nx] = nb
+                    heapq.heappush(pq, (-nb, nx, ny))
+    return best
+
+
 def rebuild_path(pred: np.ndarray, w: int, dst: tuple[int, int]) -> list[tuple[int, int]]:
     dx, dy = dst
     idx = dy * w + dx
@@ -219,7 +247,11 @@ def path_metrics(
     b: tuple[float, float],
     dijkstra_cache: dict | None = None,
 ) -> dict | None:
-    """Ground-path metrics between two positions: length, min/mean width, curvature."""
+    """Ground-path metrics between two positions: length, min/mean width, curvature.
+
+    ``min_width`` is the bottleneck (widest-path) choke, ``mean_width`` is the mean
+    clearance along the shortest path, both from the distance transform (2 * clearance).
+    """
     sa = _snap_to_walkable(walkable, a)
     sb = _snap_to_walkable(walkable, b)
     if sa is None or sb is None:
@@ -235,12 +267,27 @@ def path_metrics(
         return None
     length = float(dist[sb[1], sb[0]])
     path = rebuild_path(pred, w, sb)
-    widths = [2.0 * float(edt[y, x]) for x, y in path]
+    # mean width along the shortest path (finite cells only; base disks are +inf)
+    finite = [2.0 * float(edt[y, x]) for x, y in path if np.isfinite(edt[y, x])]
+
+    # min width = bottleneck (widest-path) clearance, cached per source
+    if dijkstra_cache is not None:
+        bkey = ("bneck", sa)
+        bneck = dijkstra_cache.get(bkey)
+        if bneck is None:
+            bneck = bottleneck_from(walkable, edt, sa)
+            dijkstra_cache[bkey] = bneck
+    else:
+        bneck = bottleneck_from(walkable, edt, sa)
+    bval = bneck[sb[1], sb[0]]
+    # fall back to shortest-path finite min if the whole corridor was masked (very close bases)
+    min_width = 2.0 * float(bval) if np.isfinite(bval) else (min(finite) if finite else 0.0)
+
     euclid = math.hypot(sa[0] - sb[0], sa[1] - sb[1]) or 1.0
     return {
         "path_length": round(length, 2),
-        "min_width": round(min(widths), 2) if widths else 0.0,
-        "mean_width": round(float(np.mean(widths)), 2) if widths else 0.0,
+        "min_width": round(min_width, 2),
+        "mean_width": round(float(np.mean(finite)), 2) if finite else 0.0,
         "curvature": round(length / euclid, 3),
     }
 
