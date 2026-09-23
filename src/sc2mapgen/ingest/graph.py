@@ -150,6 +150,188 @@ def clearance(walkable: np.ndarray) -> np.ndarray:
     return ndimage.distance_transform_edt(walkable)
 
 
+def _line_intersection(lines: list[tuple[tuple[float, float], tuple[float, float]]]):
+    """Least-squares intersection of lines, each given as (point, unit-direction).
+
+    Minimizes the sum of squared perpendicular distances to all lines. Returns (x, y) or
+    None if the lines are (near-)parallel (singular normal matrix)."""
+    A = np.zeros((2, 2))
+    b = np.zeros(2)
+    for (px, py), (dx, dy) in lines:
+        # projector onto the normal of the line: (I - d d^T)
+        m = np.array([[1.0 - dx * dx, -dx * dy], [-dx * dy, 1.0 - dy * dy]])
+        A += m
+        b += m @ np.array([px, py])
+    if abs(np.linalg.det(A)) < 1e-6:
+        return None
+    x = np.linalg.solve(A, b)
+    return (float(x[0]), float(x[1]))
+
+
+def detect_nonbase_nodes(
+    base_xy: list[tuple[float, float]],
+    ramps: list[Ramp],
+    walkable: np.ndarray,
+    ramp_mask: np.ndarray,
+    main_xy: list[tuple[float, float]] | None = None,
+    base_near_radius: float = 16.0,
+    cluster_radius: float = 14.0,
+    single_offset: float = 9.0,
+    peak_window: int = 9,
+    peak_min_clear: float = 3.2,
+    base_core_tol: float = 8.0,
+    min_base_dist: float = 10.0,
+    near_k: int = 3,
+    far_tol: float = 0.0,
+    merge_radius: float = 11.0,
+) -> list[dict]:
+    """Infer non-base nodes from where ramps/passages *lead* and from open land pockets.
+
+    Two complementary signals, both placed at the *center of the land mass* (never on a
+    ramp/path):
+
+      (A) Ramp-axis exits: a ramp end not near a real base "leads out" to a non-base. The
+          node sits where the contributing ramps' center axes intersect (2+ exits) or
+          offset along a single exit's axis.
+      (B) Room centers: a local maximum of ground-clearance (the widest, most interior
+          point of a land-mass pocket) that contains no base is a non-base room. This
+          catches rooms reached by flat passages (no ramp), which (A) alone misses.
+
+    Both are snapped to the most interior (highest ground-clearance) cell, then near-
+    duplicates within ``merge_radius`` are merged. Returns ``{"point", "weight"}`` dicts.
+    """
+    h, w = walkable.shape
+    ground = walkable & ~ramp_mask  # land mass excludes the ramps/paths themselves
+    edt = ndimage.distance_transform_edt(ground)
+    _, gnd_idx = ndimage.distance_transform_edt(~ground, return_indices=True)
+
+    base_cells: list[tuple[int, int]] = []
+    for bx, by in base_xy:
+        ix, iy = int(round(bx)), int(round(by))
+        if 0 <= ix < w and 0 <= iy < h:
+            base_cells.append((ix, iy))
+    # mask of ground within base_core_tol of any base -> "belongs to a base"
+    base_mask = np.zeros((h, w), dtype=bool)
+    for ix, iy in base_cells:
+        base_mask[iy, ix] = True
+    if base_cells:
+        base_dist = ndimage.distance_transform_edt(~base_mask)
+        base_influence = base_dist <= base_core_tol
+    else:
+        base_dist = np.full((h, w), np.inf)
+        base_influence = np.zeros((h, w), dtype=bool)
+
+    def snap_and_center(x: float, y: float) -> tuple[float, float]:
+        ix = min(max(int(round(x)), 0), w - 1)
+        iy = min(max(int(round(y)), 0), h - 1)
+        sy, sx = int(gnd_idx[0][iy, ix]), int(gnd_idx[1][iy, ix])
+        rw = int(round(cluster_radius))
+        x0, x1 = max(0, sx - rw), min(w - 1, sx + rw)
+        y0, y1 = max(0, sy - rw), min(h - 1, sy + rw)
+        sub = np.where(ground[y0 : y1 + 1, x0 : x1 + 1], edt[y0 : y1 + 1, x0 : x1 + 1], -1.0)
+        if sub.max() > 0:
+            ry, rx = np.unravel_index(int(np.argmax(sub)), sub.shape)
+            return (float(x0 + rx), float(y0 + ry))
+        return (float(sx), float(sy))
+
+    candidates: list[dict] = []
+
+    # (A) ramp-axis exit nodes -------------------------------------------------
+    exits: list[dict] = []
+    for r in ramps:
+        if r.top is None or r.bottom is None:
+            continue
+        ends = [(float(r.bottom[0]), float(r.bottom[1])), (float(r.top[0]), float(r.top[1]))]
+        for k, end in enumerate(ends):
+            if base_xy:
+                dmin = min(math.hypot(end[0] - bx, end[1] - by) for bx, by in base_xy)
+                if dmin <= base_near_radius:
+                    continue
+            other = ends[1 - k]
+            axis = (end[0] - other[0], end[1] - other[1])
+            n = math.hypot(*axis) or 1.0
+            exits.append({"end": end, "dir": (axis[0] / n, axis[1] / n)})
+
+    clusters: list[list[dict]] = []
+    for e in exits:
+        for cl in clusters:
+            cx = sum(q["end"][0] for q in cl) / len(cl)
+            cy = sum(q["end"][1] for q in cl) / len(cl)
+            if math.hypot(e["end"][0] - cx, e["end"][1] - cy) <= cluster_radius:
+                cl.append(e)
+                break
+        else:
+            clusters.append([e])
+
+    for cl in clusters:
+        pt = _line_intersection([(e["end"], e["dir"]) for e in cl]) if len(cl) >= 2 else None
+        if pt is None:
+            mx = sum(e["end"][0] for e in cl) / len(cl)
+            my = sum(e["end"][1] for e in cl) / len(cl)
+            dx = sum(e["dir"][0] for e in cl) / len(cl)
+            dy = sum(e["dir"][1] for e in cl) / len(cl)
+            dn = math.hypot(dx, dy) or 1.0
+            pt = (mx + single_offset * dx / dn, my + single_offset * dy / dn)
+        candidates.append({"point": snap_and_center(*pt), "weight": len(cl)})
+
+    # (B) non-base room centers = clearance local maxima not on/near a base ------
+    mx = ndimage.maximum_filter(edt, size=peak_window)
+    peak_mask = ground & (edt == mx) & (edt >= peak_min_clear) & (~base_influence)
+    pys, pxs = np.where(peak_mask)
+    # process widest first so the room's true center wins non-max suppression
+    for v, x, y in sorted(zip(edt[pys, pxs], pxs, pys), reverse=True):
+        candidates.append({"point": (float(x), float(y)), "weight": int(round(v))})
+
+    # merge near-duplicates (prefer the higher-weight / ramp-axis point) -------
+    candidates.sort(key=lambda nd: nd["weight"], reverse=True)
+    merged: list[dict] = []
+    for nd in candidates:
+        for m in merged:
+            if math.hypot(nd["point"][0] - m["point"][0], nd["point"][1] - m["point"][1]) <= merge_radius:
+                m["weight"] = max(m["weight"], nd["weight"])
+                break
+        else:
+            merged.append(dict(nd))
+
+    # drop any node that snapped on top of / right next to a base. Ramp-axis nodes (A)
+    # skip the peak base-clearance check, so their intersection can land on a base pad.
+    if base_xy:
+        merged = [
+            nd
+            for nd in merged
+            if min(math.hypot(nd["point"][0] - bx, nd["point"][1] - by)
+                   for bx, by in base_xy) > min_base_dist
+        ]
+
+    # far-side gate: relative to each main, a real non-base must lie *beyond* at least one
+    # of the main's few nearest bases (incl. natural). Drop anything nestled in a main's
+    # inner pocket (near side of every nearby base) -- those are the main's own area, not
+    # a destination. A node must pass this for *every* main to survive.
+    mains = list(main_xy or [])
+    if mains and base_xy:
+        rings: list[list[tuple[float, float]]] = []
+        for mx0, my0 in mains:
+            others = [b for b in base_xy if math.hypot(b[0] - mx0, b[1] - my0) > 1e-6]
+            others.sort(key=lambda b: math.hypot(b[0] - mx0, b[1] - my0))
+            rings.append(others[:near_k])
+
+        def far_side_ok(p: tuple[float, float]) -> bool:
+            for (mx0, my0), ring in zip(mains, rings):
+                # beyond at least one nearby base B: (P-B) . (B-M) > -far_tol
+                beyond = False
+                for bx, by in ring:
+                    dxm, dym = bx - mx0, by - my0
+                    if (p[0] - bx) * dxm + (p[1] - by) * dym > -far_tol:
+                        beyond = True
+                        break
+                if not beyond:
+                    return False
+            return True
+
+        merged = [nd for nd in merged if far_side_ok(nd["point"])]
+    return merged
+
+
 def _snap_to_walkable(walkable: np.ndarray, xy: tuple[float, float]) -> tuple[int, int] | None:
     """Nearest walkable cell to a float position (base centers sit on townhall footprints)."""
     h, w = walkable.shape

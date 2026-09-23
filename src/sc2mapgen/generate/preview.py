@@ -13,14 +13,17 @@ from sc2mapgen.generate.skeleton import Skeleton
 from sc2mapgen.ir import BaseKind
 
 _EDGE_STYLE = {
-    "natural": ("orange", 2.4, "-"),
-    "standard": ("#4a90d9", 1.6, "-"),
-    "flank": ("#c0392b", 1.6, "--"),
+    "natural": ("orange", "-"),
+    "out": ("#e67e22", "-"),
+    "standard": ("#4a90d9", "-"),
+    "junction": ("#16a085", "-"),
 }
 _NODE_STYLE = {
-    BaseKind.MAIN: ("red", 220),
-    BaseKind.NATURAL: ("orange", 150),
-    BaseKind.BASE: ("gold", 90),
+    BaseKind.MAIN: ("red", 260),
+    BaseKind.NATURAL: ("orange", 180),
+    BaseKind.BASE: ("gold", 110),
+    BaseKind.ROOM: ("#9b59b6", 90),      # non-base interior room/plaza
+    BaseKind.JUNCTION: ("#16a085", 45),  # midpoint Y-split pseudo-node
 }
 
 
@@ -36,13 +39,16 @@ def render(skel: Skeleton, out_path: str | Path) -> Path:
                                fill=False, edgecolor="#444", lw=1.0))
 
     pts = [(b.x, b.y) for b in skel.bases]
+    # edge line width scales with the corridor width so chokes read as thin lines
     for e in skel.edges:
-        col, lw, ls = _EDGE_STYLE.get(e.kind, ("#4a90d9", 1.6, "-"))
+        col, ls = _EDGE_STYLE.get(e.kind, ("#4a90d9", "-"))
         (x0, y0), (x1, y1) = pts[e.a], pts[e.b]
-        ax.plot([x0, x1], [y0, y1], color=col, lw=lw, ls=ls, zorder=1)
+        ax.plot([x0, x1], [y0, y1], color=col, lw=0.6 + 0.5 * e.width, ls=ls, zorder=1)
 
+    # node marker area scales with node width (widest part of its locale)
     for b in skel.bases:
-        col, size = _NODE_STYLE[b.kind]
+        col, base_size = _NODE_STYLE[b.kind]
+        size = base_size if b.kind == BaseKind.JUNCTION else base_size + 8.0 * b.width
         ax.scatter([b.x], [b.y], s=size, c=col, edgecolors="black", linewidths=0.7, zorder=2)
 
     # symmetry center
@@ -50,10 +56,12 @@ def render(skel: Skeleton, out_path: str | Path) -> Path:
 
     n_main = sum(1 for b in skel.bases if b.kind == BaseKind.MAIN)
     n_nat = sum(1 for b in skel.bases if b.kind == BaseKind.NATURAL)
+    n_room = sum(1 for b in skel.bases if b.kind == BaseKind.ROOM)
+    n_junc = sum(1 for b in skel.bases if b.kind == BaseKind.JUNCTION)
     ax.set_title(
-        f"skeleton seed={skel.seed} priors={skel.priors}\n"
-        f"{skel.grid_w}x{skel.grid_h}  {len(skel.bases)} bases "
-        f"({n_main}M/{n_nat}N)  {len(skel.edges)} edges"
+        f"skeleton seed={skel.seed} priors={skel.priors} sym={skel.symmetry}\n"
+        f"{skel.grid_w}x{skel.grid_h}  {n_main}M/{n_nat}N/{n_room}room/{n_junc}junc  "
+        f"{len(skel.edges)} edges"
     )
     ax.set_xlim(-2, skel.grid_w + 2)
     ax.set_ylim(-2, skel.grid_h + 2)

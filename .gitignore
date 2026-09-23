@@ -16,3 +16,6 @@ gold_maps/_modern/
 # Generated dataset / spike outputs
 dataset/
 outputs/
+
+# Local build tooling (StormLib checkout + build tree + compiled dylib; has its own nested .git)
+.tools/

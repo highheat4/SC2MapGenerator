@@ -52,6 +52,17 @@ def render(mapir: MapIR, out_path: str | Path) -> Path:
             ramp_mask[y, x] = True
     rgb[ramp_mask] = np.array([0.1, 0.8, 0.9])
 
+    # infer non-base nodes from where ramps lead (exits not pointing at a nearby base)
+    from sc2mapgen.ingest.graph import detect_nonbase_nodes
+
+    nonbase_nodes = detect_nonbase_nodes(
+        [(b.x, b.y) for b in mapir.bases],
+        mapir.ramps,
+        walkable,
+        ramp_mask,
+        main_xy=[(b.x, b.y) for b in mapir.bases if b.kind == BaseKind.MAIN],
+    )
+
     fig, ax = plt.subplots(figsize=(10, 10))
     # origin lower: SC2 (0,0) is bottom-left; array row 0 is y=0
     ax.imshow(rgb, origin="lower", interpolation="nearest")
@@ -67,6 +78,13 @@ def render(mapir: MapIR, out_path: str | Path) -> Path:
         rx = [rg.centroid[0] for rg in mapir.regions]
         ry = [rg.centroid[1] for rg in mapir.regions]
         ax.scatter(rx, ry, c="#ff2fd0", s=22, marker="D", edgecolors="black", linewidths=0.4, zorder=4)
+
+    # inferred NON-BASE nodes (from converging ramp exits); size grows with convergence
+    if nonbase_nodes:
+        nx = [nd["point"][0] for nd in nonbase_nodes]
+        ny = [nd["point"][1] for nd in nonbase_nodes]
+        ax.scatter(nx, ny, s=90, c="#8a2be2", marker="s", edgecolors="white",
+                   linewidths=1.4, zorder=6, label="non-base node")
 
     # resources
     def scatter(kind, color, marker, size):
@@ -99,7 +117,8 @@ def render(mapir: MapIR, out_path: str | Path) -> Path:
 
     ax.set_title(
         f"{mapir.map_name}  ({mapir.width}x{mapir.height}, "
-        f"{len(mapir.bases)} bases, {len(mapir.ramps)} ramps)"
+        f"{len(mapir.bases)} bases, {len(mapir.ramps)} ramps, "
+        f"{len(nonbase_nodes)} non-base nodes)"
     )
     ax.set_xlim(-1, w)
     ax.set_ylim(-1, h)
