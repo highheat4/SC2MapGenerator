@@ -33,7 +33,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import ndimage
 
-from sc2mapgen.generate.skeleton import SkelEdge, Skeleton
+from sc2mapgen.generate.skeleton import Skeleton
 from sc2mapgen.ir import (
     BaseKind, BaseNode, MapIR, Ramp, Rect, Resource, ResourceKind,
     ramp_cell_cliffs, snap_uphill,
@@ -56,68 +56,29 @@ class RasterConfig:
     junction_scale: float = 0.8                 # junctions are modest plazas, not full rooms
     anchor_growth: float = 1.5                  # fixed MAIN/NATURAL growth (not openness-tuned)
 
-    # elevation levels
-    main_level: int = 2
-    natural_level: int = 1
-    generic_levels: tuple[int, ...] = (0, 1, 2)
-    generic_level_weights: tuple[float, ...] = (0.42, 0.4, 0.18)
+    # elevation levels are OWNED BY THE SKELETON now (generate/skeleton.GenConfig: main_level /
+    # natural_level / generic_levels / generic_level_weights). The rasterizer reads each node's tier
+    # from ``SkelBase.level`` and only PAINTS it -- it no longer draws or nudges levels.
 
     # corridor widths come straight from the skeleton edges; floor only:
     min_width: float = 3.0
 
-    # A level-changing lane is rendered as a NARROW CHOKE (ramp): a single SC2 <ramp> quad
-    # only spans a narrow band, so a corridor-wide ramp gets partial coverage and its flanks
-    # stay a wall (the map's two halves then seal off -- see findings S4.4). Real FrostLE ramps
-    # are all ~3-4-wide clean chokes one quad fully bridges. So we cap the width of any edge
-    # carrying a level change to this, independent of the (wider) skeleton edge width. Same-level
-    # lanes keep their full skeleton width.
+    # A level change is rendered as a NARROW CHOKE: one SC2 <ramp> quad covers only a narrow band, so
+    # a corridor-wide ramp is partly covered and its flanks stay walls, sealing the map (findings
+    # §4.4). Cap any level-changing edge to this width; same-level lanes keep full skeleton width.
     ramp_choke_width: float = 4.0
-    # A level-changing connection is painted as a CLEAN STRAIGHT STAIRCASE snapped to one of the
-    # 8 ramp directions (cardinal or diagonal), flanked by same-level flat approach lanes -- exactly
-    # like gold-standard maps (LostandFoundLE etc.), where every ramp is a compact uniform choke at
-    # a plateau interface, NOT a bent slice of a corridor. The straight rectangle is aligned to the
-    # SAME direction the exporter snaps to, so the export's linear +8/cell gradient is seamless with
-    # both plateaus and the <ramp> quad covers it fully. ``ramp_run`` is the staircase length in
-    # world cells along the (snapped) uphill axis.
-    #
-    # ★ VERIFIED (scripts/rampstep_probe.py, engine pathing-grid + real unit move, findings §4.5):
-    # the <rampList> QUAD is the SOLE controller of ramp walkability -- a quad-covered transition is
-    # traversable REGARDLESS of the cliff-gradient step (even a 1-cell 64-jump crosses; a gentle
-    # 8-cell staircase with NO quad is a wall). The old "engine caps at <=8 cliff/cell, so a 64 climb
-    # needs >=8 cells" rule is DISPROVEN. So ``run`` is free to be SHORT -- what still matters is that
-    # the ramp stays a CLEAN narrow band one quad can cover (the ramp_cleanliness gate). We target
-    # real pro-map dimensions (AutomatonAIE et al.: run median ~4.5, width median ~11).
+    # A level change is painted as a CLEAN STRAIGHT STAIRCASE snapped to one of the 8 ramp directions,
+    # flanked by same-level approach lanes, aligned to the direction the exporter snaps to so the
+    # +8/cell gradient and the <ramp> quad cover it fully (findings §4.4/§4.5). ``ramp_run`` is the
+    # staircase length (cells) along the uphill axis.
     ramp_run: float = 6.0
 
-    # TERRACE-mode ramp SIZE VARIETY. Each cut samples a (width, run) in these ranges.
-    #
-    # RUN with the (now default) TRUE-ISOLINE gradient (findings §4.10, ir.isoline_gradient_ranks):
-    # the cliff steps +8 per lattice AXIS-cell, so a one-level (64) climb is EXACTLY 8 axis-cells --
-    # gold's short FIXED run. A diagonal band needs >= ~8 isolines of run, i.e. ~8 world-cells along
-    # the uphill axis, so we ship run (8,10). VERIFIED: at (8,10) the isoline gradient gives STRICT
-    # yield 65/120 (vs the legacy rank-order gradient's 59/120 at the LONGER (11,14)) and fixes real
-    # in-engine dead-ends (seeds 5 & 22 fully connect via scripts/mainconn_probe.py). Below ~8 the
-    # diagonal band drops under 8 isolines and tops out short (islands the high plateau): isoline
-    # (6,8) falls to 20/60. HISTORY (legacy rank-order gradient, set RANK_ORDER_RAMPS): it spread the
-    # sub-levels evenly over the band's DISTINCT projections, so a diagonal one-level climb needed a
-    # run >= 8*sqrt2 ~= 11.3 (shorter packed Delta16 walls); run=(4,6) gave median step 16 and STRICT
-    # 6/60, run=(11,14) gave median step 8 and STRICT 42-48/60. We ALSO tried stretching the exporter's
-    # <rampList> quad to rescue short runs -- HARMFUL (engine auto-expands a top-anchored quad;
-    # stretching overshoots and BREAKS detection, §4.5).
-    #
-    # AUTHORED band WIDTH is kept MODERATE (findings §4.9). The earlier "SC2 detector is orientation-
-    # biased on wide ramps" theory (§4.6) was the WRONG mechanism: the real cause of seed 22's sealed
-    # main was our OVERSIZED rampList quad, not the band width. We used to size the quad to the full
-    # band; a quad wider than the true cliff band balloons the ramp footprint (37->148 cells), drifts
-    # its center, and spawns a PHANTOM ramp into the plateau, which seals the real exit (proven single-
-    # variable in scripts/_rampmut.py, §4.8). FIX (now shipped): emit a SMALL fixed quad (width~4, run 2)
-    # like gold and let the engine auto-expand it -- see export/sc2map.py build_ramp_list. With the small
-    # quad, seed 22 detects a CLEAN 6 ramps (no phantoms) and MAIN1<->MAIN2 fully connects at THIS width.
-    # The engine expands our authored 6.6x12.5 band into a ~16x14 WALKABLE ramp -- already wider than
-    # gold's ~10x8, so no need to widen the authored band. Widening the authored band to (6,10)+ is
-    # actively HARMFUL: STRICT yield falls 32->21/60 AND it re-breaks main->natural traversability
-    # offline-invisibly (verified seeds 11,13). So we hold (4,6). (Making ramps gold-TIGHT -- shorter
-    # run, less blobby -- needs 45-deg-isoline gradient rework at short run; logged as a follow-up.)
+    # TERRACE-mode per-cut ramp size variety (width, run). With the default true-isoline gradient
+    # (findings §4.10) the cliff steps +8 per axis-cell, so a one-level climb is a fixed ~8-cell run;
+    # a diagonal band needs >= ~8 isolines, hence run (8,10) (STRICT yield 65/120; seeds 5 & 22
+    # connect in-engine). The authored band WIDTH is held MODERATE: a quad wider than the true band
+    # balloons the footprint and spawns phantom ramps that seal the exit, and widening the band re-
+    # breaks traversability offline-invisibly, so we hold (4,6) (findings §4.6/§4.8/§4.9).
     ramp_choke_range: tuple[float, float] = (4.0, 6.0)
     ramp_run_range: tuple[float, float] = (8.0, 10.0)
 
@@ -165,20 +126,12 @@ class RasterConfig:
 
     weirdness: float = 0.0
 
-    # TERRACE-FIRST ramp model (see findings §4.4 "clean staircases"). When on, ramps are NOT
-    # painted per skeleton edge. Instead we paint solid same-level terraces, WALL every level
-    # boundary by default, then cut ONE choke-width straight staircase per terrace-pair that must
-    # connect (well-separated, locked). This decouples ramp GEOMETRY from edge count, so clustered
-    # crossings can't fuse into unauthorable blobs. Default ON (measured yield 11/60 -> 35/60 with
-    # exact rot180 symmetry and relief preserved); force the legacy per-edge path with NO_TERRACE=1.
-    #
-    # The terrace carve cuts ~one staircase per cross-level EDGE, so a fragmented multi-terrace seed
-    # over-carves (seed 42: 14 ramps, 7 needed). A post-extraction REDUNDANT-CROSSING PRUNE (in
-    # ``rasterize``; opt-out NO_PRUNE_CROSSINGS) then walls the surplus, fusion-prone crossings in
-    # mirror pairs while keeping every real base connected under the exact validate_map oracle -- so
-    # offline yield can't drop (measured 65 -> 67/120) and the survivors are the minimal, well-
-    # separated, cardinal-leaning set gold maps use. This targets the seed-42 in-engine over-report
-    # class (findings §4.11); the deeper cure is skeleton-level level ownership (§4.4 note, §12).
+    # TERRACE-FIRST ramp model (findings §4.4): don't paint ramps per edge; paint solid same-level
+    # terraces, WALL every level boundary, then cut ONE choke-width straight staircase per terrace-pair
+    # that must connect (locked), so clustered crossings can't fuse into unauthorable blobs. A post-
+    # extraction redundant-crossing prune (in ``rasterize``; opt-out NO_PRUNE_CROSSINGS) walls the
+    # surplus fusion-prone crossings in mirror pairs without dropping offline yield (findings §4.11).
+    # Default ON; force the legacy per-edge path with NO_TERRACE=1.
     terrace_mode: bool = True
 
 
@@ -339,171 +292,6 @@ def _ramp_band(p0, p1, ext0: float, ext1: float, ramp_len: float,
     return (t_a, t_b) if hi <= lo else (lo, hi)
 
 
-def _clamp_levels(bases, edges, level: list[int], mirror: list[int]) -> None:
-    """Force every (non-junction-mediated) corridor to be a single level step: for each
-    skeleton edge, ``|level[a] - level[b]| <= 1``. MAIN/NATURAL levels are fixed; JUNCTION
-    levels are recomputed as the (rounded, clamped) mean of their two parents each pass, so a
-    junction spanning parents 0 & 2 lands at 1 and yields two clean single-step ramps (the
-    intended staircase). Only free (BASE/ROOM) nodes are moved, and always together with
-    their symmetric partner so pair-symmetry is preserved. Bounded iteration; any residual
-    is caught by the ramp regularizer + validator downstream."""
-    fixed = (BaseKind.MAIN, BaseKind.NATURAL)
-
-    def recompute_junctions() -> None:
-        for i, b in enumerate(bases):
-            if b.kind == BaseKind.JUNCTION and b.parents:
-                p0, p1 = b.parents
-                level[i] = int(np.clip(round((level[p0] + level[p1]) / 2.0), 0, 2))
-
-    def move(u: int, toward: int) -> bool:
-        if bases[u].kind in fixed or bases[u].kind == BaseKind.JUNCTION:
-            return False
-        step = 1 if level[toward] > level[u] else -1
-        nl = int(np.clip(level[u] + step, 0, 2))
-        if nl == level[u]:
-            return False
-        level[u] = nl
-        level[mirror[u]] = nl
-        return True
-
-    for _ in range(60):
-        recompute_junctions()
-        changed = False
-        for e in edges:
-            a, b = e.a, e.b
-            if abs(level[a] - level[b]) <= 1:
-                continue
-            if move(a, b) or move(b, a):
-                changed = True
-                continue
-            # neither endpoint is directly movable (e.g. a junction's third branch to a
-            # fixed node): nudge a free parent of whichever endpoint is a junction.
-            for jn, other in ((a, b), (b, a)):
-                if bases[jn].kind == BaseKind.JUNCTION and bases[jn].parents:
-                    if any(move(p, other) for p in bases[jn].parents):
-                        changed = True
-                        break
-        if not changed:
-            break
-    recompute_junctions()
-
-
-def _nullify_cross_level_junctions(bases, edges, level: list[int], mirror: list[int]):
-    """Remove any JUNCTION that would sit between two DIFFERENT-level parents, together with ALL of
-    its incident edges, and let the constrained-edge reconnect stitch the remaining VALID nodes back
-    together.
-
-    A Y-junction ``M=(A+B)/2`` whose parents differ in level forces a level change at the 3-way tap:
-    ``M`` lands at the rounded mean, so both ``A->M`` and ``B->M`` want to ramp into the same point --
-    an unauthorable fused blob (the ``run==0`` seam seen in-game, findings §4.4). Equalising the
-    parents instead (moving their levels together) flattens the whole map and *lowers* yield (measured
-    7/60 -> 5/60, level mix 37/38/25 -> 57/26/16). So rather than reshape terrain, we DELETE the
-    offending junction and its edges; the real nodes it used to route (its two parents and its
-    third-branch target) are reconnected downstream by :func:`_build_constrained_edges` using only
-    valid same-level / single-step edges among the surviving nodes. Mirror-safe: a junction and its
-    partner are removed together, so symmetry is preserved. Returns ``(surviving_edges, removed)``."""
-    removed: set[int] = set()
-    for i, b in enumerate(bases):
-        if b.kind == BaseKind.JUNCTION and b.parents:
-            a, c = b.parents
-            if level[a] != level[c]:
-                removed.add(i)
-                removed.add(mirror[i])
-    if not removed:
-        return edges, removed
-    surviving = [e for e in edges if e.a not in removed and e.b not in removed]
-    return surviving, removed
-
-
-def _enforce_ramp_gaps(bases, edges, level: list[int], mirror: list[int],
-                       pad_half: float, run_min: int = 8) -> None:
-    """A level change between two PAD-bearing bases is only walkable if the gap between their pads is
-    at least ``run_min`` cells (an 8/cell gradient can't climb a 64 level in a shorter run, see
-    findings S4.4). Where two real bases sit closer than ``2*pad + run_min`` centre-to-centre and are
-    at different levels, equalise them (flatten that lane to a same-level passage). Level variety is
-    preserved via room-mediated edges -- ROOMs have no pad, so their ramps can run the full gap.
-    MAIN/NATURAL levels are fixed; only free (BASE) nodes move, together with their symmetric
-    partner. Bounded iteration."""
-    fixed = (BaseKind.MAIN, BaseKind.NATURAL)
-    min_span = 2.0 * (pad_half + 0.5) + run_min
-    for _ in range(30):
-        changed = False
-        for e in edges:
-            a, b = e.a, e.b
-            if bases[a].kind not in _REAL_BASES or bases[b].kind not in _REAL_BASES:
-                continue
-            if level[a] == level[b]:
-                continue
-            d = math.hypot(bases[a].x - bases[b].x, bases[a].y - bases[b].y)
-            if d >= min_span:
-                continue                              # enough room for a real ramp -> keep it
-            # too close: equalise. Move whichever endpoint is free (not MAIN/NATURAL).
-            if bases[a].kind not in fixed:
-                mv, tgt = a, level[b]
-            elif bases[b].kind not in fixed:
-                mv, tgt = b, level[a]
-            else:
-                continue                              # both fixed (main<->natural): leave as-is
-            if level[mv] == tgt:
-                continue
-            level[mv] = tgt
-            level[mirror[mv]] = tgt
-            changed = True
-        if not changed:
-            break
-
-
-def _break_peaks_pits(bases, edges, level: list[int], mirror: list[int]) -> None:
-    """Flatten strict PEAK / PIT nodes (degree>=2) to a neighbour level, preserving slopes.
-
-    A node strictly HIGHER than every neighbour (peak) or strictly LOWER (pit) forces a ramp on
-    *every* incident edge; those ramps climb it from all sides and FUSE over its (small) plateau
-    into one blob with no single flow axis -- unauthorable as a clean staircase, so it voids out and
-    seals the map (see findings S4.4). Moving such a node to the median neighbour level turns it into
-    a SLOPE (>=1 neighbour at its level, ramps only on the remaining sides) whose ramps have a real
-    same-level plateau between them and don't fuse. Slopes/landings (a level between two neighbours)
-    are LEFT ALONE so relief variety is preserved -- only the pathological peaks/pits are removed.
-
-    MAIN is a peak by design but has a single edge (its natural ramp), so degree<2 excludes it.
-    JUNCTION levels are derived from parents (recomputed here); free parents are nudged instead.
-    Symmetric partners move together. Bounded iteration; residuals caught by the relief validator."""
-    fixed = (BaseKind.MAIN, BaseKind.NATURAL)
-    adj: dict[int, list[int]] = {i: [] for i in range(len(bases))}
-    for e in edges:
-        adj[e.a].append(e.b)
-        adj[e.b].append(e.a)
-
-    def recompute_junctions() -> None:
-        for i, b in enumerate(bases):
-            if b.kind == BaseKind.JUNCTION and b.parents:
-                p0, p1 = b.parents
-                level[i] = int(np.clip(round((level[p0] + level[p1]) / 2.0), 0, 2))
-
-    def move_to(u: int, tgt: int) -> bool:
-        if bases[u].kind in fixed or level[u] == tgt:
-            return False
-        if bases[u].kind == BaseKind.JUNCTION:
-            return bool(u) and any(move_to(p, tgt) for p in (bases[u].parents or ()))
-        level[u] = tgt
-        level[mirror[u]] = tgt
-        return True
-
-    for _ in range(200):
-        recompute_junctions()
-        changed = False
-        for i, b in enumerate(bases):
-            if b.kind in fixed or len(adj[i]) < 2:
-                continue
-            nbl = [level[x] for x in adj[i]]
-            if level[i] > max(nbl) or level[i] < min(nbl):     # strict peak / pit
-                tgt = int(np.clip(round(float(np.median(nbl))), min(nbl), max(nbl)))
-                if move_to(i, tgt):
-                    changed = True
-        if not changed:
-            break
-    recompute_junctions()
-
-
 def _diff_boundary(elev: np.ndarray, walk: np.ndarray) -> np.ndarray:
     """Walkable cells adjacent (4-neigh) to a walkable cell of a different elevation."""
     diff = np.zeros_like(walk, dtype=bool)
@@ -644,6 +432,29 @@ def engine_cliff_grid(walk: np.ndarray, elev: np.ndarray, ramps) -> np.ndarray:
                 ramp_mask[iy, ix] = True
     channel_ramp_flanks(cliff, ramp_mask)
     return cliff
+
+
+def cardinal_ramp_bridge(ramps, shape: tuple[int, int]) -> np.ndarray | None:
+    """Per-cell ramp id (``engine_components`` ``bridge``) for gold-profile CARDINAL ramps only.
+
+    Their staircase steps +16/+24 (``ir.cardinal_profile``), which the strict ``<=8`` rule reads as
+    walls although the quad makes them walkable in-engine. Diagonal ramps keep the strict rule (a
+    blanket bridge false-accepted seed 22's diagonal, see validate_map). None if there are none.
+    """
+    from sc2mapgen.ir import is_gold_cardinal
+
+    h, w = shape
+    rid = np.zeros((h, w), dtype=np.int32)
+    for i, r in enumerate(ramps, start=1):
+        if r.top is None or r.bottom is None:
+            continue
+        if not is_gold_cardinal(r.top[0] - r.bottom[0], r.top[1] - r.bottom[1]):
+            continue
+        for (x, y) in r.cells:
+            ix, iy = int(x), int(y)
+            if 0 <= ix < w and 0 <= iy < h:
+                rid[iy, ix] = i
+    return rid if rid.any() else None
 
 
 def engine_components(cliff: np.ndarray, max_step: int = 8,
@@ -875,7 +686,8 @@ def _lengthen_ramps(walk: np.ndarray, elev: np.ndarray, ramp: np.ndarray,
     the extreme low/high projection) one cell into the adjacent plateau -- this lengthens the run
     while keeping the ramp a clean narrow channel (NOT a blob, which would break the rampList quad
     alignment, see findings S4.4). Base pads are never eaten (pad-pad lanes too short to fit a ramp
-    are flattened upstream by _enforce_ramp_gaps). Deterministic, symmetric-in -> symmetric-out.
+    are flattened upstream by the skeleton's level-constrained edge builder). Deterministic,
+    symmetric-in -> symmetric-out.
     Ramps boxed in by pads/void that can't reach run_min are left for the relief validator."""
     yy, xx = np.mgrid[0 : elev.shape[0], 0 : elev.shape[1]].astype(np.float64)
     is_pad = pad_level >= 0
@@ -1305,250 +1117,6 @@ def _bases_connected(walk: np.ndarray, bases) -> tuple[bool, np.ndarray]:
 # --------------------------------------------------------------------------- #
 # main entry
 # --------------------------------------------------------------------------- #
-def _seg_seg_dist(p, q, r, s) -> float:
-    """Minimum Euclidean distance between 2D segments p-q and r-s."""
-    def sub(a, b):
-        return (a[0] - b[0], a[1] - b[1])
-
-    def dot(a, b):
-        return a[0] * b[0] + a[1] * b[1]
-
-    d1, d2, rr = sub(q, p), sub(s, r), sub(p, r)
-    a, e, f = dot(d1, d1), dot(d2, d2), dot(d2, rr)
-    eps = 1e-9
-    if a <= eps and e <= eps:
-        return math.hypot(*sub(p, r))
-    if a <= eps:
-        t = min(1.0, max(0.0, f / e))
-        return math.hypot(*sub(p, (r[0] + d2[0] * t, r[1] + d2[1] * t)))
-    c = dot(d1, rr)
-    if e <= eps:
-        sN = min(1.0, max(0.0, -c / a))
-        return math.hypot(*sub((p[0] + d1[0] * sN, p[1] + d1[1] * sN), r))
-    b = dot(d1, d2)
-    denom = a * e - b * b
-    sN = min(1.0, max(0.0, (b * f - c * e) / denom)) if denom > eps else 0.0
-    tN = (b * sN + f) / e
-    if tN < 0.0:
-        tN, sN = 0.0, min(1.0, max(0.0, -c / a))
-    elif tN > 1.0:
-        tN, sN = 1.0, min(1.0, max(0.0, (b - c) / a))
-    c1 = (p[0] + d1[0] * sN, p[1] + d1[1] * sN)
-    c2 = (r[0] + d2[0] * tN, r[1] + d2[1] * tN)
-    return math.hypot(*sub(c1, c2))
-
-
-def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=None):
-    """Rasterizer-owned edge selection under the user's two constraints (see design notes):
-
-      RULE 1 -- an edge may join A,B only if ``|level[A]-level[B]| <= 1`` (diff 0 = flat
-      same-level passage, diff 1 = one clean ramp). A >=2-level gap edge is NEVER created --
-      those nodes stay connected only through other <=1 paths (a 2-level ramp is unauthorable;
-      see findings S4.4).
-
-      RULE 2 -- no two RAMP staircases may touch (they would fuse into an unauthorable blob).
-      Same-level passages may overlap/merge freely (open ground).
-
-    Strategy (levels-then-edges): keep all same-level passages; add the mandatory main->natural
-    ramps; then add only ramps that BRIDGE two still-separate components and don't touch an
-    already-placed ramp (so ramps stay sparse, distinct chokes -- the routed single-path look).
-    If that leaves the map disconnected, nudge a node's level ONLY where forced, flattening a
-    dropped candidate into a passage to reconnect. Symmetric: edges are added in mirror pairs.
-    Returns the kept ``SkelEdge`` list.
-    """
-    n = len(bases)
-    fixed = (BaseKind.MAIN, BaseKind.NATURAL)
-    ignore = ignore or set()          # nodes removed from the graph (e.g. nullified junctions):
-    live = [i for i in range(n) if i not in ignore]  # never counted / bridged during reconnect
-
-    def pkey(a, b):
-        ma, mb = mirror[a], mirror[b]
-        return tuple(sorted([tuple(sorted((a, b))), tuple(sorted((ma, mb)))]))
-
-    groups: dict = {}
-    for e in skel_edges:
-        groups.setdefault(pkey(e.a, e.b), []).append(e)
-
-    def dlev(e):
-        return abs(level[e.a] - level[e.b])
-
-    def elen(g):
-        e = g[0]
-        return math.hypot(pts[e.a][0] - pts[e.b][0], pts[e.a][1] - pts[e.b][1])
-
-    def ewidth(e):
-        return min(max(cfg.min_width, e.width), cfg.ramp_choke_width)
-
-    def band(e):
-        a, b = e.a, e.b
-        pa_, pb_ = pts[a], pts[b]
-        if level[a] < level[b]:
-            dx, dy = pb_[0] - pa_[0], pb_[1] - pa_[1]
-        else:
-            dx, dy = pa_[0] - pb_[0], pa_[1] - pb_[1]
-        slen = math.hypot(dx, dy) or 1.0
-        ux, uy = _snap8(dx / slen, dy / slen)
-        mx, my = (pa_[0] + pb_[0]) / 2.0, (pa_[1] + pb_[1]) / 2.0
-        hr = min(cfg.ramp_run, slen) / 2.0
-        return (mx - hr * ux, my - hr * uy), (mx + hr * ux, my + hr * uy), ewidth(e)
-
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x, y):
-        parent[find(x)] = find(y)
-
-    selected: list = []
-    added: set = set()
-    sel_bands: list = []
-    # count ramps incident to each node. A pad-less ROOM/JUNCTION has no flat plateau to hold two
-    # ramps apart, so two ramps meeting there fuse into a 0->1->2 blob (unauthorable). Cap such
-    # nodes at ONE ramp; pad-bearing bases (MAIN/NATURAL/BASE) keep a real plateau that separates
-    # an up- and a down-ramp, so they're uncapped.
-    ramp_at = [0] * n
-    padless = [bases[i].kind in (BaseKind.ROOM, BaseKind.JUNCTION) for i in range(n)]
-    # per-node span of its ramp-neighbour levels; a node whose ramp neighbours span >1 level is a
-    # 0<->1<->2 "through-node" whose up- and down-ramps fuse into an unauthorable 0-1-2 blob. NATURAL
-    # is exempt (its large pad separates the main-ramp from the out-ramp, the gold-standard layout).
-    rmin = [99] * n
-    rmax = [-99] * n
-
-    def ramp_would_overload(g):
-        for e in g:
-            for u, other in ((e.a, e.b), (e.b, e.a)):
-                if padless[u] and ramp_at[u] >= 1:
-                    return True                            # pad-less node: at most one ramp
-                if bases[u].kind not in (BaseKind.NATURAL, BaseKind.MAIN):
-                    lo = min(rmin[u], level[other])
-                    hi = max(rmax[u], level[other])
-                    if hi - lo > 1:
-                        return True                        # would become a 0-1-2 through-node
-        return False
-
-    def add_group(g, is_ramp):
-        added.add(pkey(g[0].a, g[0].b))
-        for e in g:
-            selected.append(e)
-            union(e.a, e.b)
-            if is_ramp:
-                sel_bands.append(band(e))
-                ramp_at[e.a] += 1
-                ramp_at[e.b] += 1
-                rmin[e.a] = min(rmin[e.a], level[e.b])
-                rmax[e.a] = max(rmax[e.a], level[e.b])
-                rmin[e.b] = min(rmin[e.b], level[e.a])
-                rmax[e.b] = max(rmax[e.b], level[e.a])
-
-    # keep-apart clearance: just enough that two distinct ramps' painted cells don't merge into one
-    # unauthorable component (physical anti-merge only -- NOT an aesthetic sparsity knob; multiple
-    # connections are fine and common, single-path routing should merely emerge sometimes).
-    _touch_margin = 2.0
-
-    def touches(g):
-        for e in g:
-            lo, hi, w = band(e)
-            for l2, h2, w2 in sel_bands:
-                if _seg_seg_dist(lo, hi, l2, h2) < (w + w2) / 2.0 + _touch_margin:
-                    return True
-        return False
-
-    # 1) all same-level passages (diff 0) -- free to touch/merge into open ground
-    for g in groups.values():
-        if dlev(g[0]) == 0:
-            add_group(g, False)
-
-    # 2) mandatory main->natural ramps (a main's only exit; add even if it had to touch)
-    def is_main_edge(g):
-        e = g[0]
-        return BaseKind.MAIN in (bases[e.a].kind, bases[e.b].kind)
-
-    for g in groups.values():
-        if dlev(g[0]) == 1 and is_main_edge(g) and pkey(g[0].a, g[0].b) not in added:
-            add_group(g, True)
-
-    # 3) ramps (diff 1): add every candidate ramp that doesn't touch an already-placed ramp
-    #    (RULE 2). Redundant ramps (both ends already connected) are KEPT -- multiple paths/loops
-    #    are fine and common; we only drop a ramp when it would physically merge with another.
-    #    Shortest first so the cleanest chokes win the space when two would conflict.
-    ramps = sorted([g for g in groups.values()
-                    if dlev(g[0]) == 1 and pkey(g[0].a, g[0].b) not in added], key=elen)
-    for g in ramps:
-        if touches(g):                 # RULE 2 -> skip (would merge into a blob)
-            continue
-        if ramp_would_overload(g):     # 2nd ramp at a pad-less node -> would fuse -> skip
-            continue
-        add_group(g, True)
-
-    # 4) forced reconnect: if still disconnected, reuse a dropped candidate that bridges two
-    #    components, flattening its free endpoint(s) to make a same-level passage (adjust level
-    #    ONLY here, where connectivity forces it). Fall back to nearest cross-component pair.
-    def n_components():
-        return len({find(i) for i in live})
-
-    def flatten_toward(u, tgt_level):
-        if bases[u].kind in fixed:
-            return False
-        if level[u] == tgt_level:
-            return True
-        level[u] = tgt_level
-        level[mirror[u]] = tgt_level
-        return True
-
-    for _ in range(4 * n):
-        if n_components() == 1:
-            break
-        # best dropped candidate bridging two comps: smallest level gap, then shortest
-        best = None
-        for g in groups.values():
-            e = g[0]
-            if pkey(e.a, e.b) in added or find(e.a) == find(e.b):
-                continue
-            key = (dlev(e), elen(g))
-            if best is None or key < best[0]:
-                best = (key, g)
-        if best is not None:
-            g = best[1]
-            e = g[0]
-            # collapse the gap to a passage where possible (prefer flattening the higher free end
-            # down to the lower); if a fixed endpoint blocks it, leave as a (single-step) ramp
-            if dlev(e) >= 1:
-                hi, lo = (e.a, e.b) if level[e.a] > level[e.b] else (e.b, e.a)
-                if not flatten_toward(hi, level[lo]):
-                    flatten_toward(lo, level[hi])
-            add_group(g, dlev(e) == 1)
-            continue
-        # no candidate edge left: bridge the two nearest nodes across components directly
-        comps: dict = {}
-        for i in live:
-            comps.setdefault(find(i), []).append(i)
-        roots = list(comps)
-        pair = None
-        for ci in range(len(roots)):
-            for cj in range(ci + 1, len(roots)):
-                for i in comps[roots[ci]]:
-                    for j in comps[roots[cj]]:
-                        d = math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
-                        if pair is None or d < pair[0]:
-                            pair = (d, i, j)
-        if pair is None:
-            break
-        _, i, j = pair
-        if not flatten_toward(j, level[i]):
-            flatten_toward(i, level[j])
-        ne = [SkelEdge(min(i, j), max(i, j), "repair", cfg.min_width)]
-        mi, mj = mirror[i], mirror[j]
-        if {mi, mj} != {i, j}:
-            ne.append(SkelEdge(min(mi, mj), max(mi, mj), "repair", cfg.min_width))
-        add_group(ne, abs(level[i] - level[j]) == 1)
-
-    return selected
-
-
 def rasterize(skel: Skeleton, seed: int | None = None, cfg: RasterConfig | None = None) -> MapIR:
     cfg = cfg or RasterConfig()
     rng = np.random.default_rng((seed if seed is not None else skel.seed) * 2 + 1)
@@ -1569,44 +1137,36 @@ def rasterize(skel: Skeleton, seed: int | None = None, cfg: RasterConfig | None 
             return -a
         return a
 
-    # ---- per-pair level + box (rx, ry, angle), identical for a node and its mirror ----
+    # ---- levels + edges are OWNED BY THE SKELETON now (generate/skeleton._assign_levels) ----
+    # The skeleton decided each node's tier and rebuilt its graph under the level/ramp rules; here
+    # we just read them. Nullified cross-level junctions survive in ``bases`` as degree-0 pseudo-
+    # nodes (no incident edges), so we detect them from the edge set and skip painting them.
+    level = [int(b.level) for b in bases]
+    edges = skel.edges
+    _deg = [0] * len(bases)
+    for e in edges:
+        _deg[e.a] += 1
+        _deg[e.b] += 1
+    dead_junctions = {i for i, b in enumerate(bases)
+                      if b.kind == BaseKind.JUNCTION and _deg[i] == 0}
+
+    # ---- per-pair box geometry (rx, ry, angle), identical for a node and its mirror ----
     # rooms derive from the node's scalar width: short half-extent = width/2, long side is
     # width/2 * aspect. Capped nodes (MAIN/NATURAL) never exceed box_cap even after growth.
-    level = [0] * len(bases)
     rx0 = [0.0] * len(bases)
     ry0 = [0.0] * len(bases)
     ang = [0.0] * len(bases)
     is_capped = [False] * len(bases)
-    gl = np.array(cfg.generic_level_weights, dtype=float)
-    gl = gl / gl.sum()
-    # Draw ALL generic (BASE/ROOM) levels up front in ONE vectorised call from a DEDICATED rng.
-    # Drawing them one-at-a-time from `rng` interleaved with the geometry `rng.uniform` calls put
-    # the level `choice()` on a fixed stride through the PCG64 stream, which (for some preambles,
-    # e.g. seed 234) yields long CONSTANT runs -- ~90% of nodes came out level 1, flattening the
-    # whole map onto one terrace. A separate stream drawn in bulk restores the intended
-    # 0.42/0.40/0.18 spread and real relief variety. (See the flattening investigation in §4.4.)
-    lvl_rng = np.random.default_rng((seed if seed is not None else skel.seed) * 2 + 7)
-    generic_levels = lvl_rng.choice(cfg.generic_levels, size=len(bases), p=gl)
 
     done: set[int] = set()
     for i, b in enumerate(bases):
         if i in done:
-            level[i] = level[mirror[i]]
             rx0[i], ry0[i] = rx0[mirror[i]], ry0[mirror[i]]
             ang[i] = mirror_angle(ang[mirror[i]])
             is_capped[i] = is_capped[mirror[i]]
             continue
-        if b.kind == BaseKind.MAIN:
-            level[i] = cfg.main_level
+        if b.kind in (BaseKind.MAIN, BaseKind.NATURAL):
             is_capped[i] = True
-        elif b.kind == BaseKind.NATURAL:
-            level[i] = cfg.natural_level
-            is_capped[i] = True
-        elif b.kind == BaseKind.JUNCTION:
-            pa_, pb_ = b.parents if b.parents else (i, i)
-            level[i] = int(round((level[pa_] + level[pb_]) / 2.0))
-        else:  # BASE or ROOM -- distinct per-node level (keeps the routed single-path look)
-            level[i] = int(generic_levels[i])
         short = max(cfg.min_width, b.width) / 2.0
         if b.kind == BaseKind.JUNCTION:
             short *= cfg.junction_scale
@@ -1615,21 +1175,6 @@ def rasterize(skel: Skeleton, seed: int | None = None, cfg: RasterConfig | None 
         ang[i] = float(rng.uniform(0.0, math.pi))
         done.add(i)
         done.add(mirror[i])
-
-    # A JUNCTION whose two parents ended up on DIFFERENT levels forces a level change at the 3-way
-    # tap (both parent->junction edges want to ramp into one point -> an unauthorable fused blob /
-    # run==0 seam in-game). Nullify those junctions + all their edges and let the reconnect below
-    # restitch the surviving valid nodes with clean same-level / single-step edges.
-    skel_edges, dead_junctions = _nullify_cross_level_junctions(bases, skel.edges, level, mirror)
-
-    # ---- rasterizer-owned edge selection under the level/ramp constraints ----
-    # Keep DISTINCT per-node levels (relief variety / the routed single-path look) and instead
-    # constrain which EDGES exist: an edge may join two nodes only if their levels differ by <=1
-    # (0 = flat passage, 1 = one ramp); a >=2 gap edge is never created. No two ramps may touch
-    # (they would fuse). A node's level is nudged only where connectivity forces it. See
-    # _build_constrained_edges. From here on we paint/measure over ``edges`` (not skel.edges).
-    edges = _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg,
-                                     ignore=dead_junctions)
 
     # ---- per-edge corridor width comes straight from the (symmetric) skeleton edge ----
     def edge_key(a, b):
@@ -2324,7 +1869,7 @@ def rasterize(skel: Skeleton, seed: int | None = None, cfg: RasterConfig | None 
 
         def _all_connected(keep, wmask):
             cliff = engine_cliff_grid(wmask, elev, keep)
-            comp = engine_components(cliff)
+            comp = engine_components(cliff, bridge=cardinal_ramp_bridge(keep, cliff.shape))
 
             def _lab(b):
                 return int(comp[int(round(b.y)), int(round(b.x))])

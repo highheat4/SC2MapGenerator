@@ -150,9 +150,32 @@ def ramp_cell_cliffs(cells: list[tuple[int, int]], ux: float, uy: float,
     sends the top rank straight to ``hi_cliff`` and every lower rank to ``lo_cliff + 8*rank`` -- the
     ``lo, lo+8, ..., hi-16, hi`` staircase that SKIPS ``hi-8`` (the +16 top step, see ``ramp_span``).
     """
+    if is_gold_cardinal(ux, uy):
+        profile = cardinal_profile(lo_cliff, hi_cliff)
+        return [profile[min(r, len(profile) - 1)]
+                for r in isoline_gradient_ranks(cells, ux, uy, len(profile) - 1)]
     span = ramp_span(lo_cliff, hi_cliff)
     return [hi_cliff if r >= span else lo_cliff + 8 * r
             for r in gradient_ranks(cells, ux, uy, span)]
+
+
+GOLD_CARDINAL_RAMPS = not os.environ.get("LONG_CARDINAL_RAMPS")
+
+
+def is_gold_cardinal(ux: float, uy: float) -> bool:
+    """True if this uphill vector snaps to a cardinal direction and gold cardinal ramps are on."""
+    return GOLD_CARDINAL_RAMPS and snap_uphill(ux, uy)[0] < 4
+
+
+def cardinal_profile(lo_cliff: int, hi_cliff: int) -> list[int]:
+    """Gold CARDINAL staircase, low plateau first: ``lo, lo+8, lo+24, lo+40, hi``.
+
+    Every gold cardinal ramp (71 across the corpus, scripts/_gold_cardinal.py) is a 3-cell slope
+    stepping +8/+16/+16 then +24 into the high plateau -- not the 6-cell +8 diagonal staircase. The
+    engine's cardinal ramp mesh is sized for that short slope; a longer one pokes out of it as humps.
+    The >8 steps are walkable because the quad covers the ramp (findings §4.5 #4).
+    """
+    return [lo_cliff, lo_cliff + 8, lo_cliff + 24, lo_cliff + 40, hi_cliff]
 
 
 # --------------------------------------------------------------------------- #

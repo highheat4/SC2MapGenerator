@@ -30,7 +30,7 @@ import numpy as np
 from scipy import ndimage
 
 from sc2mapgen.generate.rasterize import (
-    engine_cliff_grid, engine_components, validate_base_pads, validate_ramps,
+    cardinal_ramp_bridge, engine_cliff_grid, engine_components, validate_base_pads, validate_ramps,
 )
 from sc2mapgen.ir import BaseKind, MapIR, ResourceKind
 
@@ -179,8 +179,9 @@ def validate_map(mapir: MapIR, cfg: ValidateConfig | None = None) -> ValidationR
     #     maps the engine actually sees as several disconnected level-islands -- see findings §4.4.
     ecliff = engine_cliff_grid(walk, elev, mapir.ramps)
     # engine_cliff_grid now mirrors the exporter EXACTLY (including channel_ramp_flanks), so the
-    # STRICT |Δcliff|<=8 / 4-connected metric (findings §4.4) is the oracle. We deliberately do NOT
-    # pass a ramp `bridge`: it was tried (bridge every same-ramp adjacency, modelling "a quad makes
+    # STRICT |Δcliff|<=8 / 4-connected metric (findings §4.4) is the oracle. The only bridge is for
+    # gold-profile CARDINAL ramps (+16/+24 steps by design, findings §4.13). We deliberately do NOT
+    # bridge every ramp: it was tried (bridge every same-ramp adjacency, modelling "a quad makes
     # the whole ramp walkable at ANY step") and it FALSE-ACCEPTED -- seed 22 read connected offline
     # but its short/steep diagonal natural->main ramp is a walled dead-end in-engine (user-confirmed
     # in-game + scripts/mainconn_probe.py). The quad-is-sole-controller result only holds for AXIS-
@@ -189,7 +190,7 @@ def validate_map(mapir: MapIR, cfg: ValidateConfig | None = None) -> ValidationR
     # already connect under it. Residual over-reports on quad-uncoverable ramps are backstopped by
     # the validate_ramps hard-gate below and rejection-sampled by --valid-only (§4.4 "Current
     # status"). The real cure is the source-side terrace redesign, not post-hoc oracle tuning.
-    ecomp = engine_components(ecliff)
+    ecomp = engine_components(ecliff, bridge=cardinal_ramp_bridge(mapir.ramps, ecliff.shape))
 
     def _bcomp(b) -> int:
         cx, cy = _cell(b)

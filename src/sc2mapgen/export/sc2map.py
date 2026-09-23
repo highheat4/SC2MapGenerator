@@ -21,7 +21,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from sc2mapgen.ir import BaseKind, MapIR, ResourceKind, ramp_cell_cliffs
+from sc2mapgen.ir import (BaseKind, MapIR, ResourceKind, cardinal_profile, is_gold_cardinal,
+                          ramp_cell_cliffs)
 
 # CLIF: void/unplayable -> 0. Real maps use full terrain TIERS at multiples of 64 (64, 128, 192);
 # the in-between values (72, 80, ...) are ramp gradations, NOT flat buildable ground. We therefore
@@ -108,6 +109,29 @@ def _vertex_cliff_max(cliff_cell: np.ndarray, sw: int, sh: int) -> np.ndarray:
     return verts
 
 
+def _vertex_cliff_ramp_aware(cliff_cell: np.ndarray, ramp_mask: np.ndarray,
+                             sw: int, sh: int, max_rise: int = 16) -> np.ndarray:
+    """:func:`_vertex_cliff_max`, except a vertex touching a ramp ignores cells more than
+    ``max_rise`` above its highest ramp cell. Plain max lets a high-plateau corner beside a ramp's
+    lower sub-levels spike that ramp vertex up to the plateau height -- a visible notch in the
+    slope. ``max_rise=16`` keeps the gold +16 top exit (112 -> 128) flush with the plateau.
+    """
+    verts = _vertex_cliff_max(cliff_cell, sw, sh)
+    ch, cw = cliff_cell.shape
+    rc = np.where(ramp_mask, cliff_cell, 0).astype(np.int32)
+    rmax = np.zeros((sh, sw), dtype=np.int32)
+    corners = ((slice(0, ch), slice(0, cw)), (slice(1, sh), slice(0, cw)),
+               (slice(0, ch), slice(1, sw)), (slice(1, sh), slice(1, sw)))
+    for vs in corners:
+        rmax[vs] = np.maximum(rmax[vs], rc)
+    capped = np.zeros((sh, sw), dtype=np.int32)
+    cc = cliff_cell.astype(np.int32)
+    for vs in corners:
+        ok = cc <= rmax[vs] + max_rise
+        capped[vs] = np.maximum(capped[vs], np.where(ok, cc, 0))
+    return np.where(rmax > 0, capped, verts)
+
+
 def harvest_palette(cliff: bytes, smap: bytes, hmap: bytes) -> Palette:
     """Build a :class:`Palette` from a template's CLIF / SMAP / HMAP blobs.
 
@@ -189,6 +213,7 @@ def encode_cliff(levels: np.ndarray, version: int = 100) -> bytes:
 # small quad across the full cliff band. A quad wider than the band balloons/mis-anchors the ramp
 # (findings ?4.7/?4.8, scripts/_rampmut.py). Quad `run` stays make_ramp_entry's default (2 cells).
 GOLD_QUAD_W = 4.0
+_DIAG_SHOULDER_ANCHOR = bool(os.environ.get("DIAG_SHOULDER_ANCHOR"))
 
 # Gold-standard CARDINAL trapezoid quad params (measured Goldenaura512AIE dir=0/2). base is a wide
 # lip (w=5, h=1) that reaches UP into the high plateau; mid is narrower (w=3, h=2) one `run` cell
@@ -230,7 +255,8 @@ def _tf(u, r, c, w, h) -> str:
 
 
 def make_ramp_entry(base_c, direction: int, width: float, lo: int, hi: int,
-                    run: float = 2.0) -> str:
+                    run: float = 2.0, corner_off: float | None = None,
+                    top_len: float | None = None) -> str:
     """Synthesize one t3Terrain <ramp> entry, cardinal (dir 0-3) or diagonal (dir 4-7).
 
     base_c: (x,y) center of the *uphill* edge (on the high plateau boundary).
@@ -258,13 +284,20 @@ def make_ramp_entry(base_c, direction: int, width: float, lo: int, hi: int,
         # ? The user's earlier "copy gold's trapezoid" attempt regressed because it kept the SHOULDER
         # anchor + gold's run=1; the working recipe is trapezoid + gradient-top anchor (+ a run long
         # enough to reach onto the gradient). Params are env-tunable for A/B (see CARD_* below).
-        runlen = _CARD_RUN
-        mx, my = bx - runlen * ux, by - runlen * uy
+        runlen, base_w, mid_w = _CARD_RUN, _CARD_BASE_W, _CARD_MID_W
         off = _CARD_CORNER_OFF
+        if top_len is not None:
+            # Gold cardinal sizing from the top sub-level row length L (71 ramps, exact):
+            # base.w = L/2+1, mid.w = L/2-1, low corners at +-L/2 from mid, run 1.
+            half = top_len / 2.0
+            runlen, base_w, mid_w, off = 1.0, half + 1.0, max(1.0, half - 1.0), half
+        if corner_off is not None:
+            off = corner_off
+        mx, my = bx - runlen * ux, by - runlen * uy
         llx, lly = mx - off * rx, my - off * ry
         rlx, rly = mx + off * rx, my + off * ry
-        base = _tf((ux, uy), (rx, ry), (bx, by), _CARD_BASE_W, _CARD_BASE_H)
-        mid = _tf((ux, uy), (rx, ry), (mx, my), _CARD_MID_W, _CARD_MID_H)
+        base = _tf((ux, uy), (rx, ry), (bx, by), base_w, _CARD_BASE_H)
+        mid = _tf((ux, uy), (rx, ry), (mx, my), mid_w, _CARD_MID_H)
         left_lo = _tf((ux, uy), (rx, ry), (llx, lly), 1.0, 2.0)
         right_lo = _tf((ux, uy), (rx, ry), (rlx, rly), 1.0, 2.0)
         left_hi = _tf((0, 0), (0, 0), (0.0, -2.0), 0.0, 0.0)
@@ -432,14 +465,46 @@ def build_ramp_list(mapir, palette, off_x: int, off_y: int) -> list[str]:
         # exporter actually writes (author_ramp_cliffs), so quad and staircase can't drift.
         # DIAGONAL ramps (4-7) already detect + bridge reliably with the shoulder anchor (the engine
         # expands their quad cleanly), so only re-anchor CARDINALS (0-3), the marginal class.
-        anchor = cells_t
-        if direction < 4:
-            cell_cliffs = ramp_cell_cliffs([(int(cx), int(cy)) for (cx, cy) in cells_t],
-                                           dux, duy, lo_cliff, hi_cliff)
-            grad_cells = [c for c, cv in zip(cells_t, cell_cliffs) if cv < hi_cliff]
-            anchor = grad_cells or cells_t
-        hx, hy = max(anchor, key=lambda c: c[0] * dux + c[1] * duy)
-        base_c = (hx + 0.5, hy + 0.5)
+        cell_cliffs = ramp_cell_cliffs([(int(cx), int(cy)) for (cx, cy) in cells_t],
+                                       dux, duy, lo_cliff, hi_cliff)
+        gold_card = direction < 4 and is_gold_cardinal(dux, duy)
+        top_cliff = cardinal_profile(lo_cliff, hi_cliff)[-2] if gold_card else hi_cliff - 16
+        top_row = [c for c, cv in zip(cells_t, cell_cliffs) if cv == top_cliff]
+        gold_diag = direction >= 4 and bool(top_row) and not _DIAG_SHOULDER_ANCHOR
+        if gold_diag:
+            # Gold diagonal quads (1961 ramps, scripts/_gold_quad_anchor.py): base.c = centroid of
+            # the top sub-level row + sqrt2 uphill, zero sideways offset. The furthest-uphill cell
+            # lies 4-5 cells into the flat clamped shoulder, and the engine then draws its ramp
+            # mesh over flat plateau (visible humps at both ends of the painted ramp).
+            base_c = (sum(c[0] for c in top_row) / len(top_row) + 0.5 + dux * _SQRT2,
+                      sum(c[1] for c in top_row) / len(top_row) + 0.5 + duy * _SQRT2)
+        else:
+            anchor = cells_t
+            if direction < 4:
+                anchor = [c for c, cv in zip(cells_t, cell_cliffs) if cv < hi_cliff] or cells_t
+            hx, hy = max(anchor, key=lambda c: c[0] * dux + c[1] * duy)
+            base_c = (hx + 0.5, hy + 0.5)
+        corner_off = None
+        top_len = None
+        if gold_card and top_row:
+            # Gold cardinal quads (71 ramps, scripts/_gold_cardinal.py): base.c = centroid of the
+            # top sub-level row + 0.5 uphill (the plateau edge), zero sideways offset; the quad is
+            # sized from that row's length inside make_ramp_entry.
+            n = len(top_row)
+            base_c = (sum(c[0] for c in top_row) / n + 0.5 + 0.5 * dux,
+                      sum(c[1] for c in top_row) / n + 0.5 + 0.5 * duy)
+            top_len = float(n)
+        elif direction < 4 and top_row and not _DIAG_SHOULDER_ANCHOR:
+            # max() picks ONE tied cell (the leftmost), so the quad sat off-centre and its fixed
+            # +-4 corners overshot the flank void onto the plateau beyond: a phantom ramp region
+            # a worker can walk into (seed 24's cardinal at (62,62)). Centre on the top row
+            # sideways and put the corners on its outer edges, as gold diagonals do.
+            n = len(top_row)
+            if duy:
+                base_c = (sum(c[0] for c in top_row) / n + 0.5, base_c[1])
+            else:
+                base_c = (base_c[0], sum(c[1] for c in top_row) / n + 0.5)
+            corner_off = n / 2.0
         # GOLD-FAITHFUL quad width: SMALL and fixed (~4), never wider than the true band. Gold maps
         # (Acropolis/Automaton/Frost) all declare quad width 1-5 (base.w 1.4-7.1) for bands 4.5-15 and
         # let the engine AUTO-EXPAND the small quad across the full contiguous band (findings ?4.7).
@@ -451,6 +516,12 @@ def build_ramp_list(mapir, palette, off_x: int, off_y: int) -> list[str]:
         perp = [c[0] * rvx + c[1] * rvy for c in cells_t]
         band_w = (max(perp) - min(perp)) + 1.0 if len(cells_t) > 1 else 4.0
         width = max(2.0, min(band_w, GOLD_QUAD_W))
+        if gold_diag:
+            # Gold diagonal quads declare width = top-row cells / 2 (1961 ramps, no exceptions,
+            # scripts/_gold_quad_width.py), which puts the low corner markers on the slope's two
+            # ends. A wider quad drops them past the flank void onto the plateau beyond, where the
+            # engine grows a phantom ramp region and unpathable blocks (seed 24's "nook").
+            width = max(1.0, len(top_row) / 2.0)
         _wmax = os.environ.get("QUAD_WMAX")           # experiment override (see _rampmut.py)
         if _wmax:
             width = min(band_w, float(_wmax))
@@ -460,7 +531,8 @@ def build_ramp_list(mapir, palette, off_x: int, off_y: int) -> list[str]:
         # is HARMFUL: the far edge overshoots past the low plateau into wall cells and BREAKS ramp
         # detection (verified: seed 22 natural->main ramp goes dead with a stretched quad, works with
         # the default). See findings ?4.5 "Quad stretch is harmful".
-        entries.append(make_ramp_entry(base_c, direction, width, lo_lvl, hi_lvl))
+        entries.append(make_ramp_entry(base_c, direction, width, lo_lvl, hi_lvl,
+                                       corner_off=corner_off, top_len=top_len))
     return entries
 
 
@@ -774,20 +846,30 @@ def _interp_heights(vc: np.ndarray, palette: Palette) -> tuple[np.ndarray, np.nd
     return smap.astype("<u4"), np.rint(hmap).astype("<u2")
 
 
-def build_smap(cliff_cell: np.ndarray, template_smap: bytes, palette: Palette) -> bytes:
+def _vertex_cliff(cliff_cell: np.ndarray, sw: int, sh: int,
+                  ramp_mask: np.ndarray | None) -> np.ndarray:
+    cc = cliff_cell.astype(np.int32)
+    if ramp_mask is None:
+        return _vertex_cliff_max(cc, sw, sh)
+    return _vertex_cliff_ramp_aware(cc, ramp_mask, sw, sh)
+
+
+def build_smap(cliff_cell: np.ndarray, template_smap: bytes, palette: Palette,
+               ramp_mask: np.ndarray | None = None) -> bytes:
     """Author t3SyncHeightMap by interpolating tier heights over each vertex's (max) cliff level."""
     sw = struct.unpack_from("<I", template_smap, 8)[0]
     sh = struct.unpack_from("<I", template_smap, 12)[0]
-    vc = _vertex_cliff_max(cliff_cell.astype(np.int32), sw, sh)
+    vc = _vertex_cliff(cliff_cell, sw, sh, ramp_mask)
     smap, _hmap = _interp_heights(vc, palette)
     return template_smap[:_SMAP_HEADER] + smap.tobytes()
 
 
-def build_hmap(cliff_cell: np.ndarray, template_hmap: bytes, palette: Palette) -> bytes:
+def build_hmap(cliff_cell: np.ndarray, template_hmap: bytes, palette: Palette,
+               ramp_mask: np.ndarray | None = None) -> bytes:
     """Author t3HeightMap (rendered layer) by interpolating tier tuples over each vertex's cliff."""
     sw = struct.unpack_from("<I", template_hmap, 8)[0]
     sh = struct.unpack_from("<I", template_hmap, 12)[0]
-    vc = _vertex_cliff_max(cliff_cell.astype(np.int32), sw, sh)
+    vc = _vertex_cliff(cliff_cell, sw, sh, ramp_mask)
     _smap, hmap = _interp_heights(vc, palette)
     return template_hmap[:_HMAP_HEADER] + hmap.tobytes()
 

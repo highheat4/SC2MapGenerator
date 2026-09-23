@@ -375,3 +375,18 @@ Single source of truth + opt-out. ir.isoline_gradient_ranks (via the ir.gradient
 Evidence. Proven headless first with scripts/isoline_ramp_probe.py: a code-authored locked-8 diagonal band at run = 8 anti-diagonals (~5.7 along the uphill axis, about half the old run) is walkable in-engine (derived pathing_grid component + a real Marine) at widths 4, 8 and 12; a no-quad control is a wall and run below 8 isolines tops out short. A/B over 120 seeds (scripts/isoline_yield_ab.py): isoline (8,10) gives STRICT yield 65/120 versus the old rank-order (11,14) at 59/120 — shorter runs AND higher yield. In-engine (scripts/mainconn_probe.py, pure defaults): seed 5 (a previously walled dead-end) now reaches every base (MAIN1->MAIN2 dist=223.2) and seed 22 stays connected with 6 clean ramps.
 
 Scope / still open. The isoline gradient does NOT fix the mirror-half split over-report class: the offline oracle models CLIF connectivity, not the engine's ramp DETECTION / quad coverage, so a blobby many-ramp seed can read valid offline yet split in-engine (e.g. seed 42: 17 fused ramps, MAIN1->MAIN2 unreachable). That is junction-fusion, addressed by the source-side terrace carve (the next work item), not by the gradient.
+
+### 15.15 Ramp render humps — gold quad placement + gold cardinal profile
+
+Every painted ramp on seed 24 showed two walkable, buildable humps. Detail lives in docs/SC2_MAP_FORMAT_FINDINGS.md section 4.13.
+
+Cause. Walkable + buildable means CLIF/SMAP read flat there, so the humps are the ramp mesh the ENGINE draws from each rampList quad, not our height layers. Diagonal quads were anchored at the furthest-uphill cell, which sits 4-5 cells into the isoline clamp's flat shoulder, so the mesh was drawn over plateau. Cardinal ramps used the 6-cell diagonal staircase, while gold cardinals use a short 3-cell slope that the engine's cardinal mesh is sized for.
+
+Fix (all gold-measured; each has an env opt-out for A/B):
+- Diagonal quads: base = centroid of the top sub-level row + sqrt2 uphill, zero sideways (1961 gold ramps, scripts/_gold_quad_anchor.py); width = top-row cells / 2 (scripts/_gold_quad_width.py), which keeps the low corner markers on the slope instead of the plateau (seed 24's phantom "nook"). Opt-out DIAG_SHOULDER_ANCHOR. Confirmed in-game.
+- Cardinal ramps: profile lo, lo+8, lo+24, lo+40, hi (ir.cardinal_profile), base = top-row centroid + 0.5 uphill, base.w = L/2+1, mid.w = L/2-1, run = 1, low corners at mid +/- L/2 (71 gold ramps, scripts/_gold_cardinal.py). Opt-out LONG_CARDINAL_RAMPS. The offline oracle gets a same-ramp bridge for these cardinal ramps only (rasterize.cardinal_ramp_bridge, used by validate_map and the crossing prune), because their +16/+24 steps fail the strict <=8 rule.
+- Ramp flanks: gold ramps never touch void, and a flank is the low plateau (sub-levels up to lo+40) or the high plateau (lo+48). fill_ramp_flank_voids replaces void cells next to a ramp with that plateau, and ramp-aware vertex heights stop a high-plateau corner from spiking a ramp-edge vertex. Opt-out NO_RAMP_FLANK_FIX. This did not cure the humps, but it is gold-faithful.
+
+Evidence. Seed 24 in-engine: 8/8 authored ramps detected, no phantoms, and MAIN1 reaches every base. STRICT offline yield is unchanged at 36/60. The diagonal fix is confirmed in-game; the cardinal fix is still waiting on a visual check.
+
+Still open. Our cardinal ramps are ~5 wide vs gold 8-12, so their quads are smaller than any gold cardinal quad. The ramp texture paints the flat clamped cells at both ends (cosmetic). On macOS, rendered observations return all-zero frames, so in-game visuals need a human (scripts/_ramp_shots.py doesn't work there).

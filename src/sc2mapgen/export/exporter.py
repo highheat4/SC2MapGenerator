@@ -169,14 +169,15 @@ def export_sc2map(mapir: MapIR, out_path: str | Path,
         # are crossable only at their lo/hi ends, like FrostLE) -- see findings doc S4.4.
         ramp_mask = sc2map.ramp_cell_mask(mapir, cw, ch, off_x, off_y)
         sc2map.channel_ramp_flanks(cliff, ramp_mask)
+    height_ramp_mask = None if cfg.flatten_terrain else ramp_mask
     cliff_bytes = sc2map.encode_cliff(cliff, version=version)
     objects_xml = sc2map.build_objects_xml(mapir, off_x, off_y)
     objects_bytes = objects_xml.encode("utf-8")
     replacements = {
         "t3SyncCliffLevel": cliff_bytes,
         "Objects": objects_bytes,
-        "t3SyncHeightMap": sc2map.build_smap(cliff, tmpl_smap, palette),
-        "t3HeightMap": sc2map.build_hmap(cliff, tmpl_hmap, palette),
+        "t3SyncHeightMap": sc2map.build_smap(cliff, tmpl_smap, palette, height_ramp_mask),
+        "t3HeightMap": sc2map.build_hmap(cliff, tmpl_hmap, palette, height_ramp_mask),
     }
     if cfg.flatten_terrain:
         # our terrain is flat, but the template's baked ramp meshes would still render as ghost

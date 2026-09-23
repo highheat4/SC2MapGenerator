@@ -314,10 +314,15 @@ The **flat** export (`flatten_terrain=True`, default) remains the shipped playab
 > natural, and the rush path crosses several levels. Connectivity must come from clean authorable
 > chokes, NOT from flattening the map toward one level.
 
-> *Dead code noted while instrumenting:* `_clamp_levels`, `_enforce_ramp_gaps`, `_break_peaks_pits`
-> are defined but never called; the only live node-level logic is the initial level draw plus
-> `_build_constrained_edges` (pure graph logic, zero pixel deps), so moving level ownership to the
-> skeleton is a medium lift and the natural home for junction rules like the nullify one above.
+> **✅ DONE — level ownership moved to the skeleton.** The level draw, the cross-level junction
+> nullify, and the level-constrained edge builder (pure graph logic) now live in
+> `generate/skeleton.py` (`SkeletonGenerator._assign_levels`): it writes a final tier onto each
+> `SkelBase.level` and replaces `skel.edges` with the constrained graph (|Δlevel|≤1, no fused
+> ramps); the rasterizer only READS them (`Skeleton.leveled` switches `validate()` to the level-aware
+> rules). Verified byte-identical terrain + unchanged `validate_map` yield (seeds 0–59); the dead
+> `_clamp_levels`/`_enforce_ramp_gaps`/`_break_peaks_pits` helpers were removed. This is the
+> level-ownership half only; the broader "decouple ramps from graph edges" terrace redesign in §4.4
+> "Current status" / §12 is still outstanding.
 
 ### 4.5 How ramps ACTUALLY work — the height stack, real dimensions, and why OUR runs are longer
 *Deep dive prompted by "real maps look like `run≈6`, ours is `10–12` — why, and can we cap width?"
@@ -516,71 +521,21 @@ correctly. **Even so, don't judge ramp walkability from grids** — a walkable r
 impassable cliff wall are *both* `pathing==0 & placement==0`. Use `query_pathing` (§4.1) as the
 oracle instead.
 
-### 4.6 ★★ The engine's ramp DETECTOR is orientation-biased on WIDE ramps (root cause of the mirror-asymmetric "one main sealed" bug)
+### 4.6 The mirror-asymmetric "one main sealed" bug (SUPERSEDED by §4.12)
 
-> ⚠️ **Largely SUPERSEDED by §4.12.** Later work (seed 42) showed wide DIAGONAL ramps detect fine and
-> the real systematic dropout was CARDINAL ramps whose emitted `<ramp dir>` label disagreed with SC2's
-> convention (`dir` scrambled for cardinals). Fixing the `dir` table (§4.12) restored cardinal detection
-> and reconnected the mains. The genuine residual below (engine quad-expansion parity on *marginal*
-> ramps) is real but small; the width-cap `ramp_choke_range=(4,6)` still ships for the reasons in §4.9.
+**Symptom.** On rot180 maps, one main's exit ramp was walkable while its MIRROR twin was a walled
+diagonal dead-end (user-reported, seed 22) — despite every exported channel being *provably*
+rot180-symmetric at the two ramps (CLIF/SMAP/HMAP/Pnp/quads all mirror-identical, `scripts/_symcheck.py`).
+This was first theorized as an orientation-biased detector that drops WIDE diagonal ramps, and
+"fixed" by capping width. **That mechanism was wrong** — the real causes were the oversized `<rampList>`
+quad (§4.8/§4.9) and, for the residual, our scrambled cardinal `<ramp dir>` label (§4.12). The width
+cap `ramp_choke_range=(4,6)` still ships, but for the small-quad reason in §4.9.
 
-**Symptom.** On rot180 maps, one main's exit ramp is a walkable slope while its MIRROR twin is a
-1-tile-wide walled diagonal dead-end — the SCV can't leave (user-reported, seed 22). Two *identical*
-mirror ramps behave differently, which "makes no sense" if the map is symmetric.
-
-**What it is NOT — every exported channel is PROVABLY rot180-symmetric.** We read the exported
-`.SC2Map` back and tested each terrain layer for rot180 symmetry *at the two mirror main ramps*
-(`scripts/_symcheck.py`, seed 22):
-
-| channel | rot180 symmetry at the ramp cells |
-|---|---|
-| `t3SyncCliffLevel` (CLIF) | **1.0000** (exported grid == offline `engine_cliff_grid`, 0 differing cells) |
-| `t3SyncHeightMap` (SMAP — what the engine paths on) | **exact**: 0/119 cell mismatch, ramp1 vs ramp4 |
-| `t3HeightMap` (HMAP) | **1.0000** |
-| `CellAttribute_Pnp` | **1.0000** |
-| `t3CellFlags` | 1.0000 (zeroed) |
-
-The `rampList` quad polygons for every mirror pair are exact rot180 mirrors too (uniform +1 cell
-even-grid offset). So there is **no hidden asymmetric channel** — the engine reads mirror-identical
-local data for the two ramps. (Beware: SMAP/HMAP are **169×169 vertex** grids, `u4`/`u2×3`; reading
-them as the 168² cell grid gives garbage that falsely looks ~50% asymmetric. Compare mirror **cells**
-directly, not a global grid shift.)
-
-**What it IS — the detector heuristic is not rot180-invariant, and only fails when the band is WIDE.**
-`game_info.map_ramps` on seed 22 held only **4 of our 6** ramps. Census of all 6 (each an exact
-mirror-pair member):
-
-| width (perp extent) | dir (uphill) | detected? |
-|---|---|---|
-| 7.1 | dir4 = NW (left) | ✅ |
-| 7.1 | dir7 = SE (right) | ✅ |
-| 8.5 | dir5 = NE (right) | ✅ |
-| 8.5 | dir6 = SW (left) | ❌ |
-| 9.2 | dir7 = SE (right) | ✅ |
-| **9.2** | **dir4 = NW (left)** | ❌ ← MAIN1's exit → main sealed |
-
-Pattern: **wide** (≳8) diagonal ramps whose uphill points **leftward** (dir4/dir6) are NOT
-registered as ramps; their right-pointing mirror twins are, and **narrow** (≲7) ramps register in
-**every** orientation. An unregistered ramp = the engine never opens the cliff line at its top, so
-the whole band is pathable-slope-but-sealed from the plateau above (a walled diagonal seam exactly
-one cliff-line thick — matches the in-game screenshot).
-
-**Interim fix (mechanism was wrong — real fix in §4.8/§4.9): cap ramp width narrow.**
-`ramp_choke_range=(4.0,6.0)` → measured width ~6–7 → all 6 ramps detected, seed 22 MAIN1↔MAIN2 fully
-connected in-engine, offline STRICT yield 22→32/60. **⚠ This was a workaround with the WRONG
-mechanism.** (The shipped config keeps `(4,6)`, but for the *quad* reason in §4.9, not a
-detector-width reason — with the small quad the same band width now detects a clean 6 ramps, not 8.) The trigger isn't "wide *band*" — it's our **oversized `rampList` quad** (we set the
-quad width to the band's full extent). Gold maps prove wide cliff-gradient ramps detect fine when the
-quad is SMALL: they author width~11 bands with a width~3 quad and the engine expands it (§4.7). So the
-real fix is to **decouple the quad from the band** (small fixed quad + wide band), *not* to shrink the
-band. Gold-map wide ramps are NOT doodads — they are the same cliff-gradient paradigm we use.
-
-**Consequence — the offline oracle is BLIND to ramp detection.** `validate_map`/`engine_cliff_grid`
-model CLIF *connectivity* (`|Δcliff|≤8`, 4-conn), never whether the engine will *detect* the ramp.
-So a wide-ramp map reads VALID offline yet seals a main in-engine (why seed 22 passed offline). The
-width cap is a *source-side* guarantee; the oracle cannot catch this class, only rejection-sampling
-against the real engine (or the width cap) can. Residual: some seeds (e.g. 5, 2) still split the two
-mirror halves for a *separate* reason — a center-link/`lo0→hi2` two-level ramp — tracked in §12.
+**The one durable lesson:** the offline oracle (`validate_map`/`engine_cliff_grid`) models CLIF
+*connectivity* only, and is **BLIND to ramp *detection***, so a map can read VALID offline yet seal a
+main in-engine. Only rejection-sampling against the real engine (or the source-side width/quad
+guarantees) catches this class. *(Debugging gotcha: SMAP/HMAP are **169×169 vertex** grids; reading
+them as the 168² cell grid falsely looks ~50% asymmetric — compare mirror cells, not a global shift.)*
 
 ### 4.7 ★★★ Gold-standard ramp invariants — the definitive recipe (measured across 106 gold maps)
 
@@ -615,6 +570,9 @@ band + a tiny quad that the engine expands**, NOT by authoring a 12-wide quad.
    high-plateau interface (run 2 from the top).
 4. **Single-level only.** Every gold ramp is `lo → lo+1` (1→2 or 2→3). None skip a level (no `lo0→hi2`).
 5. **Diagonal orientation** (dir 4–7), isolines at 45°. All three sampled maps use only dir 4–7.
+   *(Corpus-wide there ARE cardinal gold ramps — 71 of them. They use a different 3-cell profile,
+   `lo+8/24/40` then +24, and a trapezoid quad with `run=1`; see §4.13. Invariants 1, 3 and 6 describe
+   diagonals. Diagonal quads anchor at the top-row centroid + √2·u, with width = top-row cells / 2.)*
 6. **The `rampList` quad is TINY and uniform**: `run` = 2 cells (**every** gold ramp: base→mid = 2.83
    = 2·√2 diagonal), quad `width` param = **1–5 cells** (`base.w` = 1.41–7.07). Placed at the HIGH
    edge. The engine then **auto-expands** the small quad down and across the contiguous cliff band to
@@ -864,6 +822,10 @@ That reverted attempt missed the **anchor**. Two coupled bugs made our cardinals
    (seed 42: DETECTED 8→12, MAIN1↔MAIN2 dead). Gold avoids this with a **`base.h` lip** that reaches UP into
    the plateau.
 
+> ⚠️ **Quad geometry below SUPERSEDED by §4.13** (the `dir` table fix stands). Cardinals now use gold's
+> 3-cell profile and gold-sized trapezoid, with `run=1`. Diagonals are no longer shoulder-anchored:
+> they are anchored at the top-row centroid + √2·u, with width = top-row cells / 2.
+
 **The working recipe = gold trapezoid + gradient-top anchor** (`make_ramp_entry` cardinal branch +
 `build_ramp_list` cardinal anchor). For cardinals only (diagonals keep their shoulder-anchored rectangle,
 which already detects+bridges): anchor `base_c` at the highest-projection ramp cell whose exported cliff is
@@ -881,6 +843,80 @@ reachable incl. `BASE(74,149)` (dist 198.4, was `None`)**, MAIN1↔MAIN2 198.8, 
 The change is exporter-only (the quad never enters the offline CLIF oracle) so **STRICT yield is unchanged**.
 Residual: **1 benign phantom** on seed 42 (connectivity holds); the durable cure for phantom-prone blobby
 seeds is still the source-side terrace redesign (§4.4 "Current status").
+
+---
+
+### 4.13 ★★★ SHIPPED: gold quad placement + gold cardinal profile (the ramp "humps")
+
+**Symptom (seed 24, in-game).** Every painted ramp showed two raised humps/divots, one near the top and
+one near the bottom of the ramp texture. The humps were **walkable and buildable** (user-verified), and
+texture/level colouring was otherwise correct.
+
+**Key diagnostic: walkable + buildable ⇒ render-only, and not from our height layers.** Buildability
+comes from CLIF + SMAP, so those said "flat" there. Decoded HMAP/SMAP over the ramp were smooth and
+monotone, and the harvested palette interpolates cleanly (HMAP `adjust` is constant across tiers).
+What remains is geometry the **engine** draws itself: the ramp mesh it builds from each
+`<rampList>` quad. A quad placed off the real slope makes the engine draw ramp mesh over flat plateau.
+
+**Dead end first (kept, but it was NOT the cause): void ramp flanks.** The first hypothesis was the
+`CLIF=0` cells that `channel_ramp_flanks` and rasterizer cliff-cleanup put along ramp sides, plus the
+`_vertex_cliff_max` rule letting a high-plateau corner spike a ramp-edge vertex. Two gold facts came
+out of it and are now implemented, but the humps survived:
+- **Gold ramps never touch void.** 0 of ~2,100 sloped cells across FrostLE / AutomatonAIE /
+  AcropolisAIE / LostandFoundLE have a void neighbour; a flank is walled by the cliff step to a plateau.
+- **Gold flank rule.** Sub-levels `lo+8..lo+40` are flanked by the LOW plateau, the top sub-level
+  `lo+48` by the HIGH plateau.
+- Shipped: `sc2map.fill_ramp_flank_voids` (void next to a ramp → the plateau gold uses there; mirrored in
+  `engine_cliff_grid`) and `_vertex_cliff_ramp_aware` (a ramp vertex ignores cells >16 above its ramp
+  cells). Opt-out `NO_RAMP_FLANK_FIX`. STRICT yield unchanged (36/60, identical seed set).
+
+**Root cause 1 — DIAGONAL quads were anchored on the flat shoulder.** `build_ramp_list` anchored a
+diagonal quad at the ramp's furthest-uphill cell. The isoline clamp (§4.10) makes that cell part of a
+flat high shoulder, so on seed 24 every diagonal quad sat **4–5 cells uphill of the slope** and off to one
+side. Gold is exact (`scripts/_gold_quad_anchor.py`, **1961 diagonal ramps, zero spread**):
+`base.c = centroid of the top sub-level row (cliff % 64 == 48) + √2·u`, sideways offset 0. Walking
+downhill from `base` hits the first sloped cell after exactly 2 steps on every gold ramp
+(`scripts/_quad_vs_slope.py`). Gold diagonal quad **width = top-row cells / 2**, with
+no exceptions (`scripts/_gold_quad_width.py`: 2→1, 4→2, 6→3, 8→4, 10→5, 12→6, 14→7). That width puts the
+low corner markers on the slope's two ends; a wider quad drops them onto the plateau beyond the flank,
+where the engine grows a phantom ramp region with unpathable blocks (seed 24's "nook"). **Confirmed fixed
+in-game** (user). `DIAG_SHOULDER_ANCHOR=1` restores the old anchor.
+
+**Root cause 2 — CARDINAL ramps used the diagonal staircase.** All 71 gold cardinal ramps
+(`scripts/_gold_cardinal.py`) share one profile and one quad recipe, neither of which we had:
+
+| | gold cardinal | ours before |
+|---|---|---|
+| slope (cliff above lo, low→high) | `8, 24, 40` — **3 cells**, then **+24** into the plateau | `8…48` step 8 (6 cells), +16 top |
+| `base.c` | top-row (`lo+40`) centroid **+0.5·u** (plateau edge), sideways 0 | on the top-row cells |
+| `base.w` / `mid.w` | `L/2 + 1` / `L/2 − 1` (L = top-row cells; 8→5/3, 10→6/4, 12→7/5) | fixed 5 / 3 |
+| `base.h` / `mid.h` / `run` | 1 / 2 / **1** | 1 / 2 / 2 |
+| low corners (`w=1 h=2`) | `mid ± (L/2)·r` | `mid ± 4·r` |
+
+The engine's cardinal ramp mesh is sized for that short slope; our 6-cell slope poked out of it.
+Shipped: `ir.cardinal_profile` + `ir.is_gold_cardinal` (used by `ir.ramp_cell_cliffs`, so exporter and
+oracle agree), gold cardinal anchor/sizing in `build_ramp_list` → `make_ramp_entry(top_len=L)`.
+`LONG_CARDINAL_RAMPS=1` restores the old staircase and quad.
+
+**Oracle consequence.** The gold cardinal slope steps +16/+24, which the strict `≤8` rule reads as walls.
+`rasterize.cardinal_ramp_bridge` gives `engine_components` a same-ramp bridge for gold-profile
+**cardinal** ramps only (validator + crossing prune). Diagonals keep the strict rule: a blanket bridge
+false-accepted seed 22's diagonal (see `validate_map`). STRICT yield unchanged (36/60, identical set).
+
+**In-engine, seed 24:** `ramp_detect_probe` AUTHORED=8 / DETECTED=8, no phantoms. `mainconn_probe`:
+MAIN1 reaches the other main, both naturals and all 8 other bases. The probe prints one cardinal `MISS`
+at 5.4: it measures from the band's furthest-uphill cell with a 5.0 cutoff, and the 3-cell slope now
+sits at the band's low end. The ramp connects in `mainconn_probe`, so this is a probe artefact.
+
+**Open.** Our cardinal ramps are ~5 cells wide (`ramp_choke_range=(4,6)`) vs gold's 8–12, so their
+quads are smaller than any gold cardinal quad (`base.w` 3.5 vs 5–7). They detect and connect on seed 24;
+widening cardinals to gold's range is the next lever if they still look off. The ramp **texture** also
+covers the flat clamped cells at both ends of each ramp (`build_texture_class_grid` paints every IR ramp
+cell) — cosmetic, not shape.
+
+**Tooling note.** The macOS client returns all-zero RGB render observations (`render_data` bytes all 0),
+and `screencapture` from the agent terminal only saw the desktop. So in-game visuals still need a human;
+`scripts/_ramp_shots.py` is kept for a machine with Screen Recording permission.
 
 ---
 
@@ -1101,6 +1137,21 @@ fully-buildable single level — trust the engine's `placement_grid`.
   NB decode SMAP/HMAP as **169² vertex** grids (`u4` / `u2×3`), not the 168² cell grid.
 - `scripts/mainconn_probe.py` — MAIN1 reachability to every base via engine `pathing_grid`+`map_ramps`
   flood (authoritative) and `query_pathing`; honors `RAMP_CHOKE`/`RAMP_RUN` env to A/B ramp sizing.
+- `scripts/_gold_quad_anchor.py` — where gold puts a diagonal quad's `base.c` relative to the slope's
+  top sub-level row (1961 ramps: centroid + √2·u, sideways 0) (§4.13).
+- `scripts/_gold_quad_width.py` — gold diagonal quad width vs top-row cells (always n/2); cardinal
+  corner spread (§4.13).
+- `scripts/_gold_cardinal.py` — gold cardinal ramp census: sub-level profile, top step, quad sizes and
+  anchor vs top-row length L (71 ramps) (§4.13).
+- `scripts/_quad_vs_slope.py` — per ramp, steps from `base.c` downhill to the first sloped cell (gold
+  always 2); compares gold maps with an exported `.SC2Map`. Its `ramps()` helper is importable.
+- `scripts/_divot_probe.py` / `_divot_decode.py` / `_divot_render.py` — dump CLIF/SMAP/HMAP + the quad
+  around one ramp of an export and render it (`outputs/export/_divot_seed24.png`). NB world **y points
+  UP** (IR row y == world y); flip rows to match in-game screenshots or you'll study the wrong ramp.
+- `scripts/_nook_probe.py` — print engine pathable/buildable/`map_ramps` codes beside our CLIF for a
+  cell window (rows top = high y, matching the screen). Map must be in the SC2 maps folder.
+- `scripts/_ramp_shots.py` — camera-to-ramp screenshots via rendered observations. **Doesn't work on
+  macOS**: render frames are all zeros (§4.13).
 - `scripts/debug_ingame.py` — dump engine grids, buildable pockets, engine-detected ramps.
 - `scripts/editor_bake.py` — (obsolete) prototype editor automation; no longer needed (§4.3).
 - `scripts/export_map.py` — generate → validate → export → independent re-verify.
@@ -1141,6 +1192,11 @@ fully-buildable single level — trust the engine's `placement_grid`.
     moved to the gradient top; the gold-style trapezoid `base.h` lip at the gradient top fixes both. One
     benign phantom remains (connectivity holds). Durable end-state for phantom-prone blobby seeds is still
     the **skeleton-level level-ownership redesign** (§4.4). In-engine gate: `scripts/mainconn_probe.py 42`.
+- **Ramp render humps** — ✅ **FIXED** (§4.13). They came from `<rampList>` quads placed off the slope
+  (diagonal) and from a non-gold cardinal profile. The diagonal fix is confirmed in-game; the cardinal
+  fix is checked in-engine (detection + connectivity), and the visual check is pending.
+  - **Residual:** our cardinal ramps are ~5 wide vs gold 8–12, so their quads are smaller than any gold
+    cardinal quad. The ramp texture also covers the flat clamped cells at each ramp end.
 - **Oversized seeds** — can still exceed the largest template's playable area (§7).
 - **Edge-adjacent expansions** — occasional partly-void townhall pockets (§9).
 - **Custom preview image** — still shows the template's; a headless preview needs a square 24-bit
