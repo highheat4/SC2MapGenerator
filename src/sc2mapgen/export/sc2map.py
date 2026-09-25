@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from sc2mapgen.ir import (BaseKind, MapIR, ResourceKind, cardinal_profile, is_gold_cardinal,
-                          ramp_cell_cliffs)
+                          ramp_cell_cliffs, ramp_uphill)
 
 # CLIF: void/unplayable -> 0. Real maps use full terrain TIERS at multiples of 64 (64, 128, 192);
 # the in-between values (72, 80, ...) are ramp gradations, NOT flat buildable ground. We therefore
@@ -89,6 +89,22 @@ def _flat_vertex(cl: np.ndarray, level: int) -> tuple[int, int] | None:
                     and row_b[vx - 1] == level and row_b[vx] == level):
                 return vy, vx
     return None
+
+
+def flat_levels(cl: np.ndarray) -> set[int]:
+    """Cliff values that have at least one flat interior vertex (see :func:`_flat_vertex`)."""
+    a = cl[:-1, :-1]
+    flat = (a == cl[:-1, 1:]) & (a == cl[1:, :-1]) & (a == cl[1:, 1:])
+    return {int(v) for v in np.unique(a[flat])}
+
+
+def palette_capacity(cl: np.ndarray) -> int:
+    """Flat tiers :func:`harvest_palette` can harvest from this CLIF grid, or 0 if it has no flat
+    void vertex (such a template can't be harvested at all)."""
+    levels = flat_levels(cl)
+    if 0 not in levels:
+        return 0
+    return sum(1 for v in levels if v > 0 and v % 64 == 0)
 
 
 def _vertex_cliff_max(cliff_cell: np.ndarray, sw: int, sh: int) -> np.ndarray:
@@ -316,8 +332,12 @@ def make_ramp_entry(base_c, direction: int, width: float, lo: int, hi: int,
     rlx, rly = mx + halfw * rx, my + halfw * ry        # rightLo corner
     base = _tf((ux, uy), (rx, ry), (bx, by), width * sp, 0.0)
     mid = _tf((ux, uy), (rx, ry), (mx, my), width * sp, runlen)
-    # corners are small 2x2 markers; hi corners unused (sentinel, Var=0xffffffff)
-    cu, cr = (0.0, -1.0), (-1.0, 0.0)
+    # corners are small 2x2 markers whose frame is the ramp's u turned 45deg onto the nearest axis
+    # (gold, 1930 diagonals: dir4 u(0,-1), dir5 u(1,0), dir6 u(-1,0), dir7 u(0,1); r = u turned
+    # -90deg). One fixed frame only mirrors correctly for one direction. Hi corners unused
+    # (sentinel, Var=0xffffffff).
+    cu = (round((ux - uy) / _SQRT2), round((ux + uy) / _SQRT2))
+    cr = (cu[1], -cu[0])
     left_lo = _tf(cu, cr, (llx, lly), 2.0, 2.0)
     right_lo = _tf(cu, cr, (rlx, rly), 2.0, 2.0)
     left_hi = _tf((0, 0), (0, 0), (178.0, 178.0), 0.0, 0.0)
@@ -346,21 +366,17 @@ _snap_diag_dir = _snap_dir
 
 
 def channel_ramp_flanks(cliff_cell: np.ndarray, ramp_mask: np.ndarray, max_step: int = 8) -> int:
-    """Wall (void) plateau cells that abut a ramp's flank with a >max_step cliff jump, in place.
+    """Void high-plateau cells that abut a ramp sub-level below its top one, in place.
 
-    A ramp's gradient runs lo->hi along its length, so its long *sides* almost always differ from
-    the plateau beside them by more than one 8-step -- an impassable seam that fragments the map and
-    reads as "overlapping levels". FrostLE channels every ramp with cliff walls on its flanks, open
-    only at the lo/hi ends. Because the gradient lands on (or one step from) the plateau cliff value
-    at each end (see author_ramp_cliffs), those end cells are preserved; only the mismatched flank
-    plateau cells are voided. We never void a ramp cell (that would break the ramp itself).
-
-    GOLD-STANDARD top exit: the ramp's top sub-level is ``hi-16`` (112), so it abuts the high plateau
-    (128) with a +16 step (120 is skipped, findings ?4.7). That +16 UP step is the walkable ramp exit
-    (the quad covers it), NOT a flank wall, so we EXEMPT it. It is unambiguous: after the gradient,
-    the only non-ramp neighbour exactly +16 ABOVE a ramp cell is its high-plateau exit (a flank to the
-    low plateau is negative; a non-top flank to the high plateau is >= +24). Returns the number of
-    cells walled. Symmetric input -> symmetric output.
+    Gold ramps keep their flanks as plateau (findings ?3.2): the sub-levels ``lo+8..lo+40`` are
+    flanked by the low plateau and walled purely by the cliff step, so low-plateau flank cells are
+    left alone. Only the top sub-level (``hi-16``) may touch the high plateau, with the walkable +16
+    exit the quad covers. Where our cut leaves the high plateau wrapped around a lower sub-level
+    (``delta >= +24``), gold has no equivalent: kept as plateau, the ramp-aware vertex heights would
+    notch the plateau corner down to the slope, and lowering the cell would leave a one-cell pocket,
+    so that cell is voided. A plateau cell above a ramp cell is always its high plateau, and a +16
+    is always the top exit, so ``delta > 2*max_step`` selects exactly these cells. Ramp cells are
+    never voided. Returns the number of cells walled. Symmetric input -> symmetric output.
     """
     ch, cw = cliff_cell.shape
     d = cliff_cell.astype(np.int32)
@@ -372,8 +388,7 @@ def channel_ramp_flanks(cliff_cell: np.ndarray, ramp_mask: np.ndarray, max_step:
         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             ny, nx = y + dy, x + dx
             if 0 <= ny < ch and 0 <= nx < cw and walk[ny, nx] and not ramp_mask[ny, nx]:
-                delta = int(d[ny, nx]) - v
-                if abs(delta) > max_step and delta != 2 * max_step:
+                if int(d[ny, nx]) - v > 2 * max_step:
                     towall[ny, nx] = True
     cliff_cell[towall] = 0
     return int(towall.sum())
@@ -387,6 +402,34 @@ def ramp_cell_mask(mapir, cw: int, ch: int, off_x: int, off_y: int) -> np.ndarra
             X, Y = int(x) + off_x, int(y) + off_y
             if 0 <= X < cw and 0 <= Y < ch:
                 m[Y, X] = True
+    return m
+
+
+def ramp_cell_levels(mapir) -> list[tuple[int, int, int | None]]:
+    """``(x, y, level)`` per IR ramp cell: ``None`` on the slope, else the plateau level the cell's
+    gradient clamps to. The isoline gradient flattens cells past its span onto a plateau cliff
+    (about half of all ramp cells), so those play and should look like that plateau. The IR
+    elevation of a clamped cell is not reliably its plateau, hence the gradient."""
+    out: list[tuple[int, int, int | None]] = []
+    for r in mapir.ramps:
+        cells = [(int(x), int(y)) for (x, y) in r.cells]
+        if r.low_level is None or r.high_level is None or r.top is None or r.bottom is None:
+            out.extend((x, y, None) for (x, y) in cells)
+            continue
+        lo, hi = int(r.low_level), int(r.high_level)
+        lo_c, hi_c = (lo + 1) * 64, (hi + 1) * 64
+        for (x, y), v in zip(cells, ramp_cell_cliffs(cells, *ramp_uphill(r)[1], lo_c, hi_c)):
+            out.append((x, y, lo if v == lo_c else hi if v == hi_c else None))
+    return out
+
+
+def ramp_slope_mask(mapir, cw: int, ch: int, off_x: int, off_y: int) -> np.ndarray:
+    """Template-sized mask of the ramp cells that actually slope (see :func:`ramp_cell_levels`)."""
+    m = np.zeros((ch, cw), dtype=bool)
+    for x, y, lv in ramp_cell_levels(mapir):
+        X, Y = x + off_x, y + off_y
+        if lv is None and 0 <= X < cw and 0 <= Y < ch:
+            m[Y, X] = True
     return m
 
 
@@ -423,9 +466,9 @@ def build_ramp_list(mapir, palette, off_x: int, off_y: int) -> list[str]:
     """Synthesize a <ramp> entry per IR ramp (see make_ramp_entry / ?4 of the format findings).
 
     Each IR ramp carries ``top`` (high-plateau centroid), ``bottom`` (low-plateau centroid),
-    ``low_level``/``high_level`` and ``cells``. We snap the low->high vector to the nearest of the 8
-    ramp directions (cardinal OR diagonal -- axis-aligned ramps need a cardinal quad, see
-    scripts/axis_ramp_probe.py) and map tier indices to cliff levels (cliff//64). DIAGONAL ramps
+    ``low_level``/``high_level``, ``cells`` and, for generated maps, the planned ``direction``
+    (``ir.ramp_uphill``; an ingested ramp's low->high vector is snapped to the nearest of the 8
+    directions instead). Tier indices map to cliff levels (cliff//64). DIAGONAL ramps
     (4-7) anchor the quad at the ramp's furthest-uphill cell (the engine expands their rectangle
     quad cleanly down the band). CARDINAL ramps (0-3) instead anchor at the GRADIENT TOP and emit a
     gold-style trapezoid (make_ramp_entry) -- the isoline clamp gives cardinals a big flat high
@@ -444,11 +487,8 @@ def build_ramp_list(mapir, palette, off_x: int, off_y: int) -> list[str]:
         hi_cliff = palette.tiers[hi][0]
         lo_lvl = lo_cliff // 64
         hi_lvl = hi_cliff // 64
-        # uphill vector low->high, snapped over all 8 directions (cardinal + diagonal)
-        ux, uy = (r.top[0] - r.bottom[0]), (r.top[1] - r.bottom[1])
-        norm = (ux * ux + uy * uy) ** 0.5 or 1.0
-        ux, uy = ux / norm, uy / norm
-        direction = _snap_dir(ux, uy)
+        # the planned uphill direction (snapped from the plateau centroids for ingested ramps)
+        direction, _ = ramp_uphill(r)
         dux, duy = _RAMP_DIR_U[direction]
         cells_t = [(cx + off_x, cy + off_y) for (cx, cy) in r.cells]
         # base_c = ramp's GRADIENT TOP: the highest-projection cell still carrying a sub-level
@@ -512,7 +552,7 @@ def build_ramp_list(mapir, palette, off_x: int, off_y: int) -> list[str]:
         # footprint (37->148 cells), drifts its center off the true interface, and spawns a PHANTOM
         # ramp where the quad overshoots into the plateau -- which seals the real main exit (seed 22).
         # Proven single-variable in scripts/_rampmut.py (findings ?4.8). So: quad width = min(band, 4).
-        rvx, rvy = uy, -ux
+        rvx, rvy = duy, -dux
         perp = [c[0] * rvx + c[1] * rvy for c in cells_t]
         band_w = (max(perp) - min(perp)) + 1.0 if len(cells_t) > 1 else 4.0
         width = max(2.0, min(band_w, GOLD_QUAD_W))
@@ -628,9 +668,10 @@ def build_texture_class_grid(tier_grid: np.ndarray, mapir: "MapIR", n_tex: int,
                              off_x: int, off_y: int) -> np.ndarray:
     """Template-sized [ch, cw] uint8 of base-texture indices keyed by *intended* level.
 
-    Each terrain tier gets its own solid texture, ramp cells get a dedicated one, so levels stay
-    visually distinct even on the flat interim (where geometry is collapsed but the IR still knows
-    every cell's intended elevation). ``tier_grid`` is the intended (pre-flatten) tier grid.
+    Each terrain tier gets its own solid texture, sloped ramp cells get a dedicated one, so levels
+    stay visually distinct even on the flat interim (where geometry is collapsed but the IR still
+    knows every cell's intended elevation). A ramp's flat clamped ends take their plateau's texture.
+    ``tier_grid`` is the intended (pre-flatten) tier grid.
     """
     ramp_idx = n_tex - 1                                   # last texture reserved for ramps
     avail = [i for i in range(n_tex) if i != ramp_idx] or [0]
@@ -639,11 +680,10 @@ def build_texture_class_grid(tier_grid: np.ndarray, mapir: "MapIR", n_tex: int,
     for tier in range(int(tier_grid.max()) + 1 if tier_grid.max() >= 0 else 0):
         grid[tier_grid == tier] = tier_choices[tier % len(tier_choices)]
     ch, cw = tier_grid.shape
-    for r in mapir.ramps:
-        for x, y in r.cells:
-            tx, ty = x + off_x, y + off_y
-            if 0 <= ty < ch and 0 <= tx < cw:
-                grid[ty, tx] = ramp_idx
+    for x, y, lv in ramp_cell_levels(mapir):
+        tx, ty = x + off_x, y + off_y
+        if 0 <= ty < ch and 0 <= tx < cw:
+            grid[ty, tx] = ramp_idx if lv is None else tier_choices[lv % len(tier_choices)]
     return grid
 
 
@@ -694,6 +734,183 @@ def author_texture_mask(blob: bytes, class_grid: np.ndarray) -> bytes:
         packed = ((blocks[0::2] << 4) | blocks[1::2]).astype(np.uint8)   # hi nibble first
         out += packed.tobytes()
     return bytes(out)
+
+
+_TGA_HEADER = 18
+_MINIMAP_RAMP_RGB = (26, 204, 230)
+_CLIFF_EDGE_STEP = 32          # larger than any in-ramp step (max +24), smaller than a 64 wall
+_MOTTLE_SIGMA = 1.2
+_MOTTLE_OUTLIER = 3.0         # luminance MADs kept around a look's median
+_MOTTLE_MIN_POOL = 16
+_VOID_DARKEN = 0.65            # void = darkest painted texture's median colour, a few shades down
+
+
+def _minimap_frame(blob: bytes) -> tuple[int, int, int]:
+    """(pixel offset, width, height) of a template ``Minimap.tga``.
+
+    Every template stores an uncompressed 24-bit BGR, top-left-origin TGA (18-byte header, 26-byte
+    TGA 2.0 footer) whose sides are the playable size rounded up to a power of two. One pixel is
+    one cell; the playable rect sits centred (floor) in the image and the top row is the highest y.
+    """
+    if blob[2] != 2 or blob[16] != 24 or not blob[17] & 0x20:
+        raise ValueError("Minimap.tga is not an uncompressed 24-bit top-left TGA")
+    iw, ih = struct.unpack_from("<HH", blob, 12)
+    return _TGA_HEADER + blob[0], iw, ih
+
+
+def _minimap_window(iw: int, ih: int, playable) -> tuple[int, int, int, int, int, int]:
+    """(x0, y0, sx0, sy0, w, h): the playable rect's pixel origin, the first visible playable
+    row/col, and the visible extent (clipped to the image)."""
+    l, b, r, t = playable
+    pw, ph = r - l, t - b
+    x0, y0 = (iw - pw) // 2, (ih - ph) // 2
+    sx0, sy0 = max(0, -x0), max(0, -y0)
+    return x0, y0, sx0, sy0, min(pw - sx0, iw - x0 - sx0), min(ph - sy0, ih - y0 - sy0)
+
+
+def read_minimap_cells(blob: bytes, playable, cw: int, ch: int) -> tuple[np.ndarray, np.ndarray]:
+    """Template minimap resampled onto the cell grid: ``(rgb [ch, cw, 3], valid [ch, cw])``."""
+    start, iw, ih = _minimap_frame(blob)
+    img = np.frombuffer(blob[start:start + iw * ih * 3], dtype=np.uint8).reshape(ih, iw, 3)[..., ::-1]
+    l, b, r, t = playable
+    x0, y0, sx0, sy0, w, h = _minimap_window(iw, ih, playable)
+    win = img[y0 + sy0:y0 + sy0 + h, x0 + sx0:x0 + sx0 + w][::-1]
+    rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
+    valid = np.zeros((ch, cw), dtype=bool)
+    Y0 = t - sy0 - h
+    rgb[Y0:Y0 + h, l + sx0:l + sx0 + w] = win
+    valid[Y0:Y0 + h, l + sx0:l + sx0 + w] = True
+    return rgb, valid
+
+
+def write_minimap_cells(blob: bytes, rgb: np.ndarray, playable) -> bytes:
+    """Return ``blob`` with the playable window painted from ``rgb`` ([ch, cw, 3], cell grid) and
+    everything outside it black. Header, footer and image size are kept."""
+    start, iw, ih = _minimap_frame(blob)
+    l, b, r, t = playable
+    x0, y0, sx0, sy0, w, h = _minimap_window(iw, ih, playable)
+    img = np.zeros((ih, iw, 3), dtype=np.uint8)
+    Y0 = t - sy0 - h
+    img[y0 + sy0:y0 + sy0 + h, x0 + sx0:x0 + sx0 + w] = rgb[Y0:Y0 + h, l + sx0:l + sx0 + w][::-1]
+    return blob[:start] + img[..., ::-1].tobytes() + blob[start + iw * ih * 3:]
+
+
+def author_minimap(blob: bytes, walkable: np.ndarray, tier_grid: np.ndarray,
+                   ramp_mask: np.ndarray, playable: tuple[int, int, int, int]) -> bytes:
+    """Preview-coloured ``Minimap.tga``: void black, walkable grey by level, ramps cyan."""
+    l, b, r, t = playable
+    walk = walkable[b:t, l:r]
+    tiers = tier_grid.astype(np.float64)
+    rgb = np.zeros(walkable.shape + (3,), dtype=np.uint8)
+    if walk.any():
+        emin, emax = tiers[walkable].min(), tiers[walkable].max()
+        shade = 0.35 + 0.65 * (tiers - emin) / max(emax - emin, 1.0)
+        rgb[walkable] = np.rint(255 * shade[walkable])[:, None].astype(np.uint8)
+    rgb[ramp_mask & walkable] = _MINIMAP_RAMP_RGB
+    return write_minimap_cells(blob, rgb, playable)
+
+
+def decode_texture_mask(blob: bytes) -> np.ndarray:
+    """Per-cell mean alpha (0-15) of every t3TextureMasks layer: ``[n_layers, cellH, cellW]``.
+    Inverse of the packing in :func:`author_texture_mask`."""
+    if blob[:4] != b"MASK":
+        raise ValueError("not a t3TextureMasks (MASK) blob")
+    _ver, _unk, sx, sy = struct.unpack_from("<4I", blob, 4)
+    layer_sz = sx * sy // 2
+    n_layers = (len(blob) - 64) // layer_sz
+    out = np.empty((n_layers, sy // 8, sx // 8), dtype=np.float32)
+    for L in range(n_layers):
+        packed = np.frombuffer(blob[64 + L * layer_sz:64 + (L + 1) * layer_sz], dtype=np.uint8)
+        px = np.empty(packed.size * 2, dtype=np.uint8)
+        px[0::2], px[1::2] = packed >> 4, packed & 0x0F
+        full = px.reshape(sy // 64, sx // 64, 64, 64).transpose(0, 2, 1, 3).reshape(sy, sx)
+        out[L] = full.reshape(sy // 8, 8, sx // 8, 8).mean(axis=(1, 3))
+    return out
+
+
+def dominant_texture(alpha: np.ndarray) -> np.ndarray:
+    """Visible texture per cell: the topmost layer at least half opaque (later layers paint over
+    earlier ones), else the most opaque layer."""
+    top = np.argmax(alpha, axis=0)
+    for L in range(alpha.shape[0]):
+        top = np.where(alpha[L] >= 8, L, top)
+    return top.astype(np.int32)
+
+
+def _minimap_classes(tex: np.ndarray, cliff: np.ndarray, n_tex: int) -> np.ndarray:
+    """Look class per cell: texture index, then ``n_tex`` void, ``n_tex+1`` cliff top (a 4-
+    neighbour drops by a wall step), ``n_tex+2`` cliff foot (a 4-neighbour rises by one)."""
+    c = cliff.astype(np.int32)
+    pad = np.pad(c, 1, mode="edge")
+    nbrs = [pad[1:-1, :-2], pad[1:-1, 2:], pad[:-2, 1:-1], pad[2:, 1:-1]]
+    top = np.zeros(c.shape, dtype=bool)
+    foot = np.zeros(c.shape, dtype=bool)
+    for n in nbrs:
+        top |= n <= c - _CLIFF_EDGE_STEP
+        foot |= n >= c + _CLIFF_EDGE_STEP
+    cls = tex.astype(np.int32).copy()
+    cls[c == 0] = n_tex
+    cls[foot] = n_tex + 2
+    cls[top & (c > 0)] = n_tex + 1
+    return cls
+
+
+def author_minimap_textured(blob: bytes, template_cliff: np.ndarray, template_alpha: np.ndarray,
+                            cliff: np.ndarray, class_grid: np.ndarray,
+                            playable: tuple[int, int, int, int], seed: int = 0) -> bytes:
+    """Editor-look ``Minimap.tga`` rebuilt from the template's own editor render.
+
+    The template minimap already shows how the editor draws each of its textures, its cliff tops
+    and feet, and its void under this tileset's lighting. Each template cell is labelled with one
+    of those looks (:func:`_minimap_classes` over its dominant texture and CLIF), and each look
+    keeps its pixels minus luminance outliers (doodads, shadows) as a pool sorted dark to light.
+    Our cells get the same labels from the exported cliff grid and texture ``class_grid``; a
+    smooth random field picks from the pool by rank, giving mottled ground with no visible tiling.
+    Void is one flat colour a few shades darker than the darkest texture painted on our map.
+    """
+    from scipy import ndimage
+
+    ch, cw = cliff.shape
+    n_tex = template_alpha.shape[0]
+    t_rgb, valid = read_minimap_cells(blob, playable, cw, ch)
+    t_cls = _minimap_classes(dominant_texture(template_alpha)[:ch, :cw], template_cliff, n_tex)
+    cls = _minimap_classes(np.clip(class_grid, 0, n_tex - 1), cliff, n_tex)
+
+    rng = np.random.default_rng(seed)
+    field = ndimage.gaussian_filter(rng.standard_normal((ch, cw)), sigma=_MOTTLE_SIGMA)
+    rank = (np.argsort(np.argsort(field, axis=None)).reshape(ch, cw) + 0.5) / field.size
+    lum_w = np.array([0.299, 0.587, 0.114])
+    ground = t_rgb[valid & (template_cliff > 0)]
+    fallback = ground.mean(axis=0) if len(ground) else np.full(3, 96.0)
+
+    rgb = np.zeros((ch, cw, 3), dtype=np.uint8)
+    darkest = None
+    for k in np.unique(cls):
+        if k == n_tex:
+            continue
+        where = cls == k
+        pool = t_rgb[(t_cls == k) & valid].astype(np.float64)
+        if len(pool):
+            lum = pool @ lum_w
+            med = np.median(lum)
+            mad = np.median(np.abs(lum - med)) + 1.0
+            keep = np.abs(lum - med) <= _MOTTLE_OUTLIER * mad
+            pool, lum = pool[keep], lum[keep]
+        if len(pool) < _MOTTLE_MIN_POOL:
+            scale = 0.5 if k >= n_tex else 1.0
+            rgb[where] = np.clip(fallback * scale, 0, 255).astype(np.uint8)
+            continue
+        order = np.argsort(lum)
+        pool, lum = pool[order], lum[order]
+        if k < n_tex:
+            mid = pool[len(pool) // 2]
+            if darkest is None or lum[len(pool) // 2] < darkest[0]:
+                darkest = (lum[len(pool) // 2], mid)
+        q = rank[where]
+        rgb[where] = pool[np.minimum((q * len(pool)).astype(int), len(pool) - 1)]
+    base = darkest[1] if darkest is not None else fallback
+    rgb[cls == n_tex] = np.clip(np.rint(base * _VOID_DARKEN), 0, 255).astype(np.uint8)
+    return write_minimap_cells(blob, rgb, playable)
 
 
 def build_tier_grid(mapir: MapIR, cw: int, ch: int, off_x: int, off_y: int,
@@ -787,11 +1004,8 @@ def author_ramp_cliffs(cliff_cell: np.ndarray, tier_grid: np.ndarray, ramps,
         # the rampList quad's 1D slope. (A BFS-from-plateau gradient makes CURVED isolines that
         # follow the plateau outline, so the quad's fixed direction only lines up in patches and the
         # engine won't path most of the ramp.) direction MUST match build_ramp_list's quad exactly,
-        # so snap the SAME low->high vector (plateau centroids r.bottom->r.top).
-        uvx = float(r.top[0] - r.bottom[0])
-        uvy = float(r.top[1] - r.bottom[1])
-        nrm = math.hypot(uvx, uvy) or 1.0
-        direction = _snap_dir(uvx / nrm, uvy / nrm)
+        # so both take it from ramp_uphill.
+        direction, _ = ramp_uphill(r)
         ux, uy = _RAMP_DIR_U[direction]
         # Staircase gradient (shared with the validator's engine_cliff_grid via ir.ramp_cell_cliffs
         # so export + oracle never drift). GOLD-STANDARD: the isoline gradient steps +8 per lattice
@@ -916,9 +1130,9 @@ def build_objects_xml(mapir: MapIR, off_x: float, off_y: float) -> str:
 
     # resources
     for r in mapir.resources:
-        utype = _UNIT_TYPE.get(r.kind)
-        if utype is None:
+        if r.kind not in _UNIT_TYPE:
             continue
+        utype = r.unit_type or _UNIT_TYPE[r.kind]
         lines.append(unit(r.x + off_x + 0.5, r.y + off_y + 0.5, utype))
 
     lines.append("</PlacedObjects>")

@@ -186,27 +186,52 @@ ROOM/JUNCTION are never emitted as IR bases.
   one vectorized call on a dedicated RNG. (Interleaving `choice(p=…)` with other draws on one
   generator produced long constant runs.) Edges are rebuilt so every linked pair differs by ≤ 1 level.
   JUNCTIONs whose parents land on different levels are deleted and the survivors reconnected, because
-  such a junction forces two ramps into one unauthorable blob. The rasterizer only reads these levels.
+  such a junction forces two ramps into one unauthorable blob, unless one tier keeps every neighbour
+  within one level with a single ramp, in which case it is kept and re-levelled. A non-natural node
+  within 30 of a MAIN never takes the main's level (their grown rooms would fuse into one plateau
+  and give the main a second entrance), and re-levelling never separates a ROOM from the base it
+  hugs. Edges may not pass through a base or room, and edges on different levels may not cross.
+- **The skeleton outputs the whole plan.** After levels, it lays out bases (`layout.py`), sizes rooms
+  (`footprint.size_rooms`), and plans every staircase (`ramps.plan_ramps`). An attempt is rejected
+  if base layouts clash, a natural isn't a closed pocket with one choke, a main ramp or natural
+  out-ramp can't be cut cleanly, or the ramp plan leaves a base unreachable. If none of
+  `max_attempts=1000` passes, `generate` raises `SkeletonError`; it never returns a skeleton that
+  breaks a rule.
+- **Rooms:** each node is a rectangular room and each edge a flat-ended corridor, giving the
+  choke → room → choke rhythm. Interior rooms grow until walkable/playable ≈ 0.50–0.62; MAIN/NATURAL
+  stay compact. A grown room gives back growth (never its own width) until it clears every corridor
+  on another level, so growth can't overwrite a connecting edge.
+- **Staircases** (`ramps.py`): every level boundary is a cliff wall, with one clean straight
+  staircase cut per terrace pair the graph needs connected, main-first then shortest-first, skipping
+  a pair some earlier cut already joined. The main→natural ramp is the gold stamp; the natural's
+  out-ramp is `natural_out_width` wide; others draw width from `ramp_width_range=(4,6)` and run from
+  `ramp_run_range=(8,10)` (the gold fixed run for the isoline gradient). A cut is refused unless each
+  half has the exact gold isoline count and a straight band, meets exactly one plateau per side,
+  climbs along the axis the exporter will snap to, and crosses no third level. It is also refused if
+  it sits within 3 empty cells of another staircase (or of its own mirror half), since the engine
+  then registers only one of them. It must not pinch an existing passage between nodes either.
+  Ground within 2 cells of a ramp's flanks doesn't count as a passage, because in-engine it isn't one.
 
 ### 15.4 Rasterizer (`generate/rasterize.py`)
 
-- Boxy terrain: each node is a rectangular room; each edge a flat-ended corridor, giving the
-  choke → room → choke rhythm. Interior rooms grow until walkable/playable ≈ 0.50–0.62; MAIN/NATURAL
-  stay compact.
-- **Terrace carve** (`terrace_mode`, default on): every level boundary is a cliff wall, with one clean
-  straight staircase cut per terrace pair the graph needs connected. Same level → flat passage; one
-  level apart → exactly one ramp. Ramp cells are locked so cleanup and repair can't re-widen them.
-- **Ramp sizes:** `ramp_choke_range=(4,6)` width, `ramp_run_range=(8,10)` run. That run is the gold
-  fixed run for the isoline gradient. Widening the band lowered yield and broke main→natural links
-  in ways the offline oracle couldn't see.
-- **Redundant-crossing prune:** remove the most fusion-prone ramps (wide diagonals first) in mirror
-  pairs while every base stays connected under the validator's oracle. Fewer ramps means less
-  in-engine detection risk. Opt-out `NO_PRUNE_CROSSINGS`.
-- Every real base gets a protected flat buildable pad. A mirror-safe repair pass guarantees a ground
-  path to every base (carving from pad edges, preferring same-level links). Cliff cleanup walls any
-  non-ramp contact between different levels.
-- Resources: 8 minerals on a 6.5 arc facing away from the base's corridors, and 2 geysers at 7.5, all
-  on the townhall's floor. This satisfies `python-sc2`'s expansion finder (findings §7).
+A deterministic compiler for the skeleton's plan. It repaints the exact ground the plan was decided
+on (`ramps.paint_ground`, using the paint settings recorded in `Skeleton.ground`), replays each planned staircase pair through the same `cut_pair`, then
+derives the MapIR ramps, buildable cells and resources. It repairs and prunes nothing: a planned cut
+that doesn't replay, or a ramp that joins no two levels, raises `RasterizeError`.
+
+- Every real base gets a protected flat buildable pad, and walls separate any contact between
+  different levels other than at a ramp.
+- **Base layouts are planned before painting** (`_plan_base_layouts`). Every real base gets one of
+  the two gold L formations (findings §7) around an integer townhall cell. The mineral corner is
+  chosen so it doesn't overlap or touch another base's core, keeps its resources ≥ 11 from any
+  same-level neighbour's (so `python-sc2` sees one expansion per base), and stays out of its own
+  corridors. Mirror partners are exact mirror images.
+- **Base invariant:** each base owns an immutable **core**, the townhall and every resource grown by
+  1 cell. It is carved out of the paint canvas, so no pass can edit it. Around it is a 3-cell
+  editable **ring** where ramps, passages and cliffs attach; ramps may touch the core but never
+  enter it. In the skeleton, a ROOM within 18 of a real base takes that base's level (a flat
+  passage into a base is harmless; a level change that close would ramp into the core), and a
+  natural sits ≥ 24 from its main so the main's staircase fits between the two cores.
 
 ### 15.5 Validator (`generate/validate.py`)
 
@@ -217,22 +242,27 @@ ROOM/JUNCTION are never emitted as IR bases.
   gold-profile cardinals); buildable pads; ramp cleanliness (one plateau per side); legal resources.
 - **Soft:** rush distance, natural↔natural choke width, terrain symmetry, base spacing, openness.
 
-Current STRICT offline yield is ~36/60 on seeds 0–59. The oracle can't see ramp *detection*, so final
+Current STRICT offline yield is 60/60 on seeds 0–59. The oracle can't see ramp *detection*, so final
 confirmation is in-engine (`scripts/mainconn_probe.py`).
 
 ### 15.6 Exporter (`export/`)
 
-A template-shell compiler: pick the smallest real template whose playable area contains the map,
-centre the map in it, overwrite the authored layers in place with StormLib, and repack. Output is
+A template-shell compiler: pick the smallest real template whose playable area contains the map's
+walkable content, centre that content in it, overwrite the authored layers in place with StormLib,
+and repack. If no template fits, export raises `TemplateFitError` (none of seeds 0–199 do). Output is
 re-read with `mpyq` to verify. See the findings doc for every file format.
 
 - **Flat (default, `flatten_terrain=True`):** one tier, walkable geometry preserved, textured by
   intended level. This is the reliably playable path.
 - **Relief (`author_ramps=True`):** real levels and walkable ramps, fully headless — a CLIF gradient
   plus one gold-style `<rampList>` quad per ramp (findings §3–4). Correct when it validates; pair with
-  `scripts/export_map.py --valid-only` to rejection-sample seeds.
+  `scripts/export_map.py --valid-only` to rejection-sample seeds. Each ramp's gradient and quad
+  climb along its planned `dir` (`Ramp.direction`, via `ir.ramp_uphill`), and the offline oracle and
+  ramp checks use the same direction. Only ingested ramps, which have no plan, snap their
+  plateau-centroid vector instead.
 - Also authored: SMAP/HMAP from harvested template tuples, textures, Pnp, start locations and
-  resources, and the map name. `MapInfo` is never touched.
+  resources, the map name, and `Minimap.tga` (the baked minimap terrain, rebuilt in the editor's
+  textured look from the template's own minimap). `MapInfo` is never touched.
 
 ### 15.7 Known gaps
 
@@ -240,7 +270,4 @@ re-read with `mpyq` to verify. See the findings doc for every file format.
 - Relief yield: some layouts can't be built with clean single-step ramps. The durable fix is fully
   decoupling ramps from graph edges.
 - Offline oracle can over-accept blobby seeds that split in-engine.
-- Cardinal ramps narrower than gold (~5 vs 8–12); ramp flanks are voided where gold uses plateau; the
-  ramp texture paints the flat ends.
-- Oversized seeds that exceed every template; occasional partly-void townhall pockets at map edges;
-  no custom preview image.
+- Cardinal ramps narrower than gold (~5 vs 8–12).

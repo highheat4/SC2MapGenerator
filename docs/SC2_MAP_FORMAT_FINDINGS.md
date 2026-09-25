@@ -35,6 +35,7 @@ editor's conceptual model). Always confirm by round-tripping a real map.
 | `t3TextureMasks` | `MASK` | yes | visible texture alpha layers (§6) |
 | `Objects` | xml | yes | start locations + resources (§7) |
 | `DocumentHeader`, `*.SC2Data\LocalizedData\GameStrings.txt` | `H2CS` / text | yes | map name (§8) |
+| `Minimap.tga` | TGA | yes | baked minimap / lobby terrain image (§8) |
 | `MapInfo` | bin | **never** | playable area / camera bounds (§8) |
 | `t3SyncPathingInfo` | `PATH` | no | derived by the engine; editing it has no effect |
 | `t3FluffDoodad`, `t3VertCol`, `t3Water`, game data, models | — | no | inherited |
@@ -159,6 +160,12 @@ Walking downhill from `base.c` hits the first sloped cell after exactly 2 steps 
   the flank onto the plateau, where the engine grows a phantom ramp region with unpathable blocks.
 - **Rectangle at the gradient top without a lip → phantoms** (cardinals); the trapezoid's
   `base.h = 1` fixes it.
+- **Two staircases too close → only one registers.** Seed 12 had a diagonal nat-out ramp 1 cell from
+  a cardinal. The engine registered just one of them and walled the other's middle isolines. Which
+  one won was not mirror-symmetric, so each half lost a different ramp, even though every exported
+  layer and quad was an exact mirror. Deleting only the neighbour's entry made the untouched quad
+  register. The planner now keeps ≥ 3 empty cells (chessboard) between staircases, including a
+  cut's two mirror halves (`RAMP_MIN_GAP`). Seeds 2 and 29 are clean in-engine at gaps of 3–4.
 
 ---
 
@@ -173,12 +180,19 @@ both the exporter (`author_ramp_cliffs`, which writes CLIF) and the offline orac
   maps to `hi` (the gold +16 step). Cells past the span clamp to `hi` (a flat shoulder, never a wall);
   a band shorter than `span` isolines tops out short and walls, hence `ramp_run_range=(8,10)`.
 - **Cardinal gradient** — `ir.cardinal_profile`: `lo, lo+8, lo+24, lo+40, hi`.
-- **Direction** — the low→high plateau-centroid vector snapped to the nearest of the 8 `dir`s
-  (`_snap_dir`).
+- **Direction** — the planned `dir` (`Ramp.direction`, via `ir.ramp_uphill`), shared by the
+  gradient, the quad and the offline oracle. The planner only accepts a staircase whose
+  plateau-centroid vector snaps to that same `dir`. Ingested ramps with no plan fall back to snapping
+  that vector.
 - **Quad** — `build_ramp_list` → `make_ramp_entry` with the gold anchors and sizes from §3.3 (a
   fallback `min(band, 4)` width applies when no top row is found).
-- **Flanks** — `channel_ramp_flanks` voids plateau cells beside a ramp whose step exceeds 8, except
-  the +16 top exit. This differs from gold, whose flanks are plateau, not void (open item, §10).
+- **Flanks** — low-plateau flank cells stay plateau, as in gold; the cliff step alone walls them
+  (the engine marks them unpathable cliff edge). `channel_ramp_flanks` voids only high-plateau cells
+  touching a sub-level below the top one (`Δ ≥ +24`), a contact gold never has: kept, they would
+  notch the plateau down to the slope; lowered, they would be one-cell pockets. The offline oracle
+  joins a +16 step only when the higher cell is a plateau (the top exit), so a `lo → lo+16` flank
+  stays a wall. In-engine A/B against voided flanks (`scripts/_flank_probe.py`, 8 seeds): same
+  detected ramps, same reachability, identical flank-to-top path distances.
 - **Pnp** — `author_pnp` writes `0x00` on all walkable cells, ramps included.
 
 Env opt-outs, for A/B only: `RANK_ORDER_RAMPS` (legacy even-spread gradient; needs run ≥ 11),
@@ -214,7 +228,10 @@ byte (high nibble first), tiled in 64×64-pixel blocks ordered +x then +y.
 - A texture set has 8 textures; a map may combine up to 4 sets / 16 textures. Parse counts
   dynamically; don't reorder the primary set. Texture names are template-specific, so pick by index.
 - `build_texture_class_grid` textures by **intended** level (even on flat exports), with a spread so
-  adjacent tiers don't get look-alike textures, and a reserved ramp texture.
+  adjacent tiers don't get look-alike textures, and a reserved ramp texture. The ramp texture goes
+  only on cells that actually slope (`ramp_cell_levels`, from the shared `ir.ramp_cell_cliffs`
+  gradient); the clamped cells at each end, about half of all ramp cells, take their plateau's
+  texture. Their IR elevation isn't a reliable guide, since some high-clamped cells carry the low level.
 
 ---
 
@@ -225,8 +242,21 @@ byte (high nibble first), tiled in 64×64-pixel blocks ordered +x then +y.
 - `python-sc2`'s expansion finder groups resources that share terrain height and lie within 10.5 of
   each other, then needs a buildable townhall spot 4–8 from the centroid, ≥ 6 from every mineral and
   ≥ 7 from every geyser. If none exists, bot init crashes with `min() arg is an empty sequence`.
-- Values that satisfy it: minerals on a 6.5 arc, geysers at 7.5, base pad half-width 9.5, nothing
-  snapped inside the townhall clearance. `scripts/check_expansions.py` replicates the finder offline.
+  Resources of neighbouring same-level bases must stay apart or the greedy merge fuses them (gold:
+  closest cross-base resources p25 12.2, median 14.1). `scripts/check_expansions.py` replicates the
+  finder offline.
+- **Gold base formations.** Of the 1,335 standard 8-mineral/2-geyser gold bases, 799 are an **L**
+  wrapping one corner of the townhall. Offsets from the townhall centre (which sits on `.5,.5`),
+  canonical corner at (−x, −y), `*` = `MineralField750`, the rest `MineralField`:
+
+  | | minerals | geysers | count |
+  |---|---|---|---|
+  | A | (−7.5,−1)\* (−6.5,−4)\* (−6.5,−2) (−6.5,0) (−5.5,−5)\* (−2.5,−6) (−0.5,−7)\* (0.5,−6) | (−7,3) (4,−7) | 272 |
+  | B | (−7.5,−1)\* (−6.5,−4)\* (−6.5,−2) (−6.5,0) (−5.5,−5) (−4.5,−6)\* (−1.5,−7)\* (−0.5,−6) | (−7,3) (3,−7) | 184 (+92 with one stagger swapped) |
+
+  Only axis flips are legal orientations: a 2×1 mineral field sits on whole-x/half-y, a 3×3 geyser
+  on half/half, and a transpose would turn the fields into 1×2. The `750` patches are always the
+  back row (~7 from the townhall). The rest are straight-side layouts (minerals along one edge).
 
 ---
 
@@ -235,7 +265,14 @@ byte (high nibble first), tiled in 64×64-pixel blocks ordered +x then +y.
 **Never edit `MapInfo`.** Playable area, full grid and camera bounds are coupled; enlarging the
 playable rect alone made the client refuse to load ("A game has not been started yet"). Instead,
 `exporter.pick_template` chooses the smallest template whose existing playable area contains our
-content, and centres it there. Read the rect with `_mapinfo_playable_offset` then
+walkable content (`content_bbox`), and centres that content there. The IR grid carries an 18-cell
+void border around its playable area; it may overhang the template grid, and every layer builder
+crops it. Fitting on the padded grid instead rejected every template for large seeds, and the
+fallback pinned the grid at `(0, 0)` so one edge's bases fell outside the playable rect. If no
+template fits, it raises `TemplateFitError` rather than export a clipped map. It skips templates
+whose palette can't be harvested (§2d): ~20 gold
+maps (`Flat*`, `Empty128`, `LastFantasyAIE`, `SiteDelta*`, `OdysseyLE`, …) contain no void cell at
+all, and relief exports also need one flat tier per level used. Read the rect with `_mapinfo_playable_offset` then
 `struct.unpack_from("<4i", mi, off)` → `(l, b, r, t)`.
 
 **Rename** (`set_document_header_name`, `set_gamestrings_name`): the displayed name is the localized
@@ -248,13 +285,30 @@ string `DocInfo/Name`, stored in two places that carry no bounds fields:
 Renaming also avoids sharing the template's client cache. Still restart SC2 when iterating on one
 template, to clear stale render/minimap caches.
 
+**Minimap** (`author_minimap`): the minimap terrain is not rendered live. It is the baked
+`Minimap.tga`, with resource and unit icons drawn on top at runtime, so an inherited image shows the
+template's terrain under our resources. All 115 gold maps store an uncompressed 24-bit BGR TGA with
+a top-left origin (18-byte header, 26-byte TGA 2.0 footer). Each side is the playable size rounded up
+to a power of two (140 → 256, 124 → 128). One pixel is one cell, the playable rect is centred
+(floor) in the image, and the top row is the highest y. We keep the template's header, size and
+footer and repaint only the pixels.
+
+The editor can't render headlessly on macOS, but the template's minimap *is* an editor render of
+the same textures we paint with (§6). `author_minimap_textured` labels every template cell with a
+look (its dominant MASK texture, or void, cliff top, or cliff foot from CLIF, where a cliff edge is
+a 4-neighbour step ≥ 32). It keeps each look's pixels, minus luminance outliers (doodads, shadows),
+as a pool sorted dark to light. Our cells get labels the same way from the exported cliff grid and
+texture class grid, and a smoothed random field picks each pixel from its pool by rank. Rebuilding
+a gold map's own minimap this way closely matches the editor's. If that fails, `author_minimap`
+paints the preview's flat colours instead.
+
 ---
 
 ## 9. Buildability, flat exports, and verification
 
 - A cell is buildable iff CLIF ≠ 0 and its SMAP neighbourhood is flat (a harvested tier). Causes of
-  "can't build here": void in the pad (bases too close to the template edge), or the base being
-  **unreachable**, not unbuildable.
+  "can't build here": void in the pad, a base outside the template's playable rect (see §8 on
+  template fitting), or the base being **unreachable**, not unbuildable.
 - **Flat export** (`flatten_terrain=True`, the default): collapse everything to one tier. Also
   `strip_render_relief` sets `<rampList num="0"/>`, otherwise the template's ramps render as ghost
   cliffs on flat ground. `_heal_flat_terrain` closes the leftover cliff-cleanup gaps
@@ -263,8 +317,10 @@ template, to clear stale render/minimap caches.
   must be TGA; a preview must be square 24-bit.
 
 **Oracles** — which checks can be trusted:
-- `query_pathing(a, b)` is valid on properly authored maps. Don't query a townhall centre (often
-  unpathable); `mainconn_probe.py` queries a small ring instead. It is **not** a slope oracle on maps
+- `query_pathing(a, b)` is valid on properly authored maps. Base centres are now standardized to be
+  pathable, so `mainconn_probe.py` queries each base's exact centre (a radius hid real breaks, e.g. a
+  half-traversable ramp); for a main, whose centre is under the start townhall, it uses the first
+  pathable cell 3 tiles off-centre. It is **not** a slope oracle on maps
   whose Pnp/cell flags were flattened to open.
 - `game_info.pathing_grid` reports ramp cells as 0, the same as walls. Real passability = pathing > 0
   or cell ∈ a detected ramp (`game_info.map_ramps`).
@@ -279,16 +335,14 @@ template, to clear stale render/minimap caches.
 
 ## 10. Open items
 
-- **Flank voids:** `channel_ramp_flanks` still voids ramp flanks; gold flanks are plateau. Switching
-  would be gold-faithful but has not been implemented.
 - **Cardinal ramp width:** ours are ~5 wide (`ramp_choke_range=(4,6)`), gold 8–12, so our cardinal
   quads are smaller than any gold one. The cardinal render fix still needs a visual check in-game.
-- **Ramp texture** covers the flat clamped cells at each ramp end (cosmetic).
-- **Offline over-acceptance:** blobby/fused many-ramp seeds can read valid offline and split
-  in-engine. The redundant-crossing prune and terrace carve reduce this; the durable fix is fully
-  decoupling ramps from graph edges.
-- **Oversized seeds** can exceed every template's playable area; **edge expansions** occasionally have
-  a partly-void townhall pocket; a **custom preview image** is not authored.
+- **Offline over-acceptance:** blobby/fused many-ramp seeds used to read valid offline and split
+  in-engine. Staircases are now planned on the skeleton (clean shape, ≥ 3-cell spacing, flank
+  halos excluded from passages), and the rasterizer only replays that plan. The offline oracle is
+  still blind to ramp detection, so in-engine probes remain the final word.
+- **Minimap** mimics the editor's look from template samples but has no real lighting, so cliff
+  shading is a 1-cell edge rather than a directional shadow.
 
 ---
 
@@ -304,6 +358,10 @@ Key probes (run with `PYTHONPATH=src .venv/bin/python scripts/<name>`):
   `_quad_vs_slope.py`, `_rampcmp.py` — gold-map measurements behind §3.2–3.3.
 - `_rampmut.py` — copy a gold map, mutate one ramp entry, read `map_ramps` back (single-variable test).
 - `_symcheck.py` — check an exported map's terrain channels for mirror symmetry.
+- `_flank_probe.py <seed>` — in-engine ramp detection, reachability and flank side-entry test
+  (`OLD_FLANKS=1` for the voided-flank A/B). `_flank_census.py` — which flank cells get voided.
+- `_pocket_census.py <a> <b> [sym]` — every exported townhall footprint is one level, unbent by its
+  ring, and inside the playable rect.
 - `_divot_probe.py` / `_divot_decode.py` / `_divot_render.py`, `_nook_probe.py` — inspect CLIF/SMAP/
   HMAP/quad and engine codes around one ramp.
 - Historical experiments that established §3.1 (kept for reproduction): `ramp_probe.py`,

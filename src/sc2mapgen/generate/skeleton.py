@@ -16,6 +16,7 @@ Design choices worth noting:
 
 from __future__ import annotations
 
+import collections
 import json
 import math
 from dataclasses import asdict, dataclass, field
@@ -23,8 +24,15 @@ from pathlib import Path
 
 import numpy as np
 
+from sc2mapgen.generate.footprint import is_nat_out, natural_pocket_problems, size_rooms
+from sc2mapgen.generate.layout import BaseLayout, layout_problems, plan_base_layouts
+from sc2mapgen.generate.ramps import Ground, PlannedRamp, plan_ramps
 from sc2mapgen.generate.priors import DefaultPriors, Priors
 from sc2mapgen.ir import BaseKind, Rect
+
+
+class SkeletonError(RuntimeError):
+    """No attempt produced a skeleton that passes every rule."""
 
 
 @dataclass
@@ -40,6 +48,13 @@ class SkelBase:
     # JUNCTION = mean of its parents). Assigned by SkeletonGenerator._assign_levels once the graph
     # is fixed, so the rasterizer only PAINTS levels rather than deciding them. See _draw_levels.
     level: int = 0
+    # final painted room: a rotated rectangle of half-extents rx/ry (footprint.size_rooms);
+    # 0/0 for a node that paints no room (a removed junction)
+    rx: float = 0.0
+    ry: float = 0.0
+    angle: float = 0.0
+    # a real base's townhall cell + resource formation (layout.plan_base_layouts)
+    layout: "BaseLayout | None" = None
 
 
 @dataclass
@@ -64,6 +79,10 @@ class Skeleton:
     # level-constrained graph (|Δlevel| <= 1 per edge, no two ramps fused). validate() picks the
     # level-aware rule set when this is set (the raw RNG degree rules no longer apply).
     leveled: bool = False
+    # every staircase, in mirror pairs [r, r'] and cut order (ramps.plan_ramps)
+    ramps: list["PlannedRamp"] = field(default_factory=list)
+    # how the ground under that plan was painted (set with the plan)
+    ground: "Ground | None" = None
 
     # --------------------------------------------------------------------- #
     def center(self) -> tuple[float, float]:
@@ -81,9 +100,15 @@ class Skeleton:
             "leveled": self.leveled,
             "bases": [{"kind": b.kind.value, "x": round(b.x, 2), "y": round(b.y, 2),
                        "pair": b.pair, "width": round(b.width, 2),
-                       "parents": b.parents, "level": b.level} for b in self.bases],
+                       "parents": b.parents, "level": b.level, "rx": round(b.rx, 2),
+                       "ry": round(b.ry, 2), "angle": round(b.angle, 4),
+                       "layout": None if b.layout is None else
+                       {"town": b.layout.town, "formation": b.layout.formation,
+                        "flip": b.layout.flip}} for b in self.bases],
             "edges": [{"a": e.a, "b": e.b, "kind": e.kind,
                        "width": round(e.width, 2)} for e in self.edges],
+            "ramps": [r.to_json_dict() for r in self.ramps],
+            "ground": self.ground.to_json_dict() if self.ground else None,
         }
 
     def save(self, path: str | Path) -> Path:
@@ -169,6 +194,25 @@ def _seg_seg_dist(p, q, r, s) -> float:
     return math.hypot(*sub(c1, c2))
 
 
+def _edge_crosses(bases, a: int, b: int, cfg: "GenConfig", ignore=()) -> bool:
+    """True if segment a-b passes too close to a node that is not one of its endpoints."""
+    return _segment_crosses(bases, (bases[a].x, bases[a].y), (bases[b].x, bases[b].y),
+                            {a, b} | set(ignore), cfg)
+
+
+def _segment_crosses(bases, p, q, skip, cfg: "GenConfig") -> bool:
+    for k, o in enumerate(bases):
+        if k in skip:
+            continue
+        if o.kind in (BaseKind.MAIN, BaseKind.NATURAL, BaseKind.BASE):
+            r = cfg.edge_base_clearance
+        else:
+            r = o.width / 2.0 + cfg.edge_room_margin
+        if _seg_seg_dist(p, q, (o.x, o.y), (o.x, o.y)) < r:
+            return True
+    return False
+
+
 def _pair_mirror(bases) -> list[int]:
     """Index of each base's symmetric partner via shared ``pair`` id (self if unpaired)."""
     groups: dict[int, list[int]] = {}
@@ -221,11 +265,25 @@ def _rng_graph(pts: list[tuple[float, float]]) -> list[tuple[int, int]]:
 class GenConfig:
     margin: float = 6.0        # keep bases this far inside the playable rect
     center_keepout: float = 6.0  # generic bases must be at least this far from dead center
-    max_attempts: int = 300
+    max_attempts: int = 1000
     # non-base ROOM nodes scattered in the interior so routes thread
     # base -> room -> room -> base (multiple chokepoints) instead of direct base->base spokes
     room_pairs: tuple[int, int] = (3, 6)   # how many symmetric interior room pairs to add
     room_spacing_frac: float = 0.62        # rooms may pack tighter than bases (x min-spacing)
+    # a ROOM closer than this to a real base takes that base's level. A base's immutable core
+    # reaches ~9 tiles from its townhall, so a level change any closer would ramp into it.
+    base_clearance: float = 18.0
+    # min main -> natural distance: both townhall cores plus a full-run staircase between them
+    natural_min_dist: float = 24.0
+    # an edge's straight segment must stay this far from every real base that is not one of its
+    # endpoints (core ~9 + 3-cell ring), and ``width/2 + edge_room_margin`` from every ROOM /
+    # JUNCTION. Otherwise its corridor is swallowed by that node's plateau and the rasterizer has
+    # to ramp through the node (seed 6: a BASE-ROOM corridor through a main).
+    edge_base_clearance: float = 12.0
+    edge_room_margin: float = 1.5
+    # a non-natural node this close to a MAIN never shares the main's level: their grown rooms
+    # would fuse into one plateau and give the main a second entrance
+    main_isolation: float = 30.0
     p_center_room: float = 0.5             # chance of a self-symmetric central room
     # symmetry modes to draw from per map (uniformly). Default is rotational only; pass
     # e.g. ("rot180", "mirror_lr", "mirror_ud") to also generate lateral-symmetry maps.
@@ -234,13 +292,15 @@ class GenConfig:
     # --- node widths (tiles). A node's scalar width bounds every incident edge; the
     # mirror of a node shares its width. Rooms are the widest (open) nodes. ---
     main_width: tuple[float, float] = (8.0, 12.0)
-    natural_width: tuple[float, float] = (7.0, 11.0)
+    natural_width: tuple[float, float] = (8.0, 11.0)   # >= natural_out_width
     base_width: tuple[float, float] = (8.0, 13.0)
     room_width: tuple[float, float] = (7.0, 16.0)
 
     # --- edge widths (tiles) ---
     main_edge_width: float = 3.0             # main's single defensible choke (small, fixed)
-    natural_out_width: tuple[float, float] = (4.0, 7.0)  # wider than main edge, capped
+    # the natural's single out-edge (flat choke or ramp): gold naturals open through an 8-wide
+    # choke (50/99 maps exactly 8, 72/99 in 8..10)
+    natural_out_width: float = 8.0
     min_edge_width: float = 3.0
     # interior edges sample uniformly in [min_edge_width, min(width[a], width[b])]
 
@@ -254,13 +314,53 @@ class GenConfig:
     generic_levels: tuple[int, ...] = (0, 1, 2)               # BASE/ROOM tiers to draw from
     generic_level_weights: tuple[float, ...] = (0.42, 0.4, 0.18)
 
-    # --- geometry the level-constrained edge builder uses to keep ramps from fusing. These are
-    # proxies for the rasterizer's paint dimensions and MUST match the corresponding RasterConfig
-    # fields (min_width / ramp_choke_width / ramp_run) so the graph's ramp-spacing decisions agree
-    # with how the rasterizer will actually paint them. ---
+    # --- painted lane widths: a floor, and a cap on a level-changing edge's lane (recorded on the
+    # skeleton's ``ground`` with the plan). ``ramp_run`` is the edge builder's staircase-length
+    # estimate for keeping ramps from fusing. ---
     min_edge_paint_width: float = 3.0
     ramp_choke_width: float = 4.0
     ramp_run: float = 6.0
+
+    # --- room footprints (footprint.size_rooms): each node's painted box is decided here ---
+    room_aspect: tuple[float, float] = (1.0, 1.7)    # long/short side ratio
+    box_cap: float = 18.0                            # MAIN/NATURAL half-extent cap
+    junction_scale: float = 0.8                      # junctions are modest plazas
+    anchor_growth: float = 1.5                       # fixed MAIN/NATURAL growth
+    # interior rooms share one growth multiplier, bisected until the walkable fraction of the
+    # playable rect lands in this band (gold 0.50-0.62). The estimate (rooms, flat corridors, pads,
+    # base cores + rings) tracks the painted map to within ~0.01.
+    target_openness: tuple[float, float] = (0.50, 0.62)
+    growth_range: tuple[float, float] = (0.7, 3.6)
+    growth_iters: int = 10
+    # painted canvas inset from the playable rect, and every real base's pad half-extent
+    canvas_border: int = 2
+    pad_half: float = 9.5
+    # --- base layouts (layout.plan_base_layouts): every real base gets one of the two gold L
+    # formations (findings §7), cornered away from its corridors. Its CORE -- the townhall grown by
+    # base_town_margin plus every resource grown by base_res_margin -- is immutable flat ground at
+    # the base's level, wrapped in a base_ring-wide ring where ramps, passages and cliffs attach.
+    base_town_margin: int = 1
+    base_res_margin: int = 1
+    base_ring: int = 3
+    # half-width of the band along each incident corridor the mineral corner is steered out of
+    base_corridor_half: float = 5.0
+    # min gap between resources of two same-level bases (gold: p25 12.2, median 14.1), so
+    # python-sc2's expansion finder keeps them as separate groups
+    res_group_clearance: float = 11.0
+    # share of bases using formation A (gold: 272 A vs 276 B-family among L bases)
+    res_formation_a_share: float = 0.5
+
+    # the natural is a closed pocket: nothing else on its level within this many cells of its
+    # footprint, and its out-corridor runs at least natural_choke_len clear before any room
+    pocket_margin: int = 2
+    natural_choke_len: float = 3.0
+
+    # --- staircases (ramps.plan_ramps): width across the isolines and run along the uphill axis of
+    # every ramp other than the main's (the gold stamp) and the natural's out-ramp
+    # (natural_out_width). The run is the gold fixed ~8-isoline climb (findings §3.2); the width is
+    # held moderate because a quad wider than the band spawns phantom ramps (findings §3.4) ---
+    ramp_width_range: tuple[float, float] = (4.0, 6.0)
+    ramp_run_range: tuple[float, float] = (8.0, 10.0)
 
 
 class SkeletonGenerator:
@@ -272,17 +372,47 @@ class SkeletonGenerator:
     def generate(self, seed: int) -> Skeleton:
         rng = np.random.default_rng(seed)
         sym = str(rng.choice(self.cfg.symmetries))  # fixed per map
-        skel = None
+        # The skeleton OWNS level determination: once the raw RNG structure passes, assign tiers
+        # and rebuild the graph under the level/ramp rules so the rasterizer only PAINTS what the
+        # skeleton decided. A levelled graph that breaks those rules (e.g. no legal bridge left to
+        # reconnect it) is rejected like a bad raw one and the next attempt is drawn.
+        # Rooms are then sized; a natural that can't be a closed pocket with one clear choke even
+        # at its neighbours' un-grown sizes rejects the attempt too, as do base layouts that clash,
+        # a main ramp or natural out-ramp that can't be cut cleanly, and a ramp plan that leaves a
+        # base unreachable. If no attempt passes, the seed has no map.
+        why: collections.Counter[str] = collections.Counter()
         for _ in range(self.cfg.max_attempts):
             skel = self._attempt(rng, seed, sym)
-            ok, _issues = validate(skel)         # gate the raw RNG structure (geometry + degrees)
-            if ok:
-                break
-        # the raw skeleton (bases + RNG connectivity) is fixed; now the skeleton OWNS level
-        # determination -- assign tiers and rebuild the graph under the level/ramp constraints so
-        # the rasterizer only PAINTS what the skeleton decided (previously done inside rasterize()).
-        self._assign_levels(skel, seed)
-        return skel
+            if not validate(skel, cfg=self.cfg)[0]:
+                why["graph"] += 1
+                continue
+            self._assign_levels(skel, seed)
+            if not validate(skel, cfg=self.cfg)[0]:
+                why["levels"] += 1
+                continue
+            self._lay_out(skel)
+            if layout_problems(skel, self.cfg):
+                why["base layouts"] += 1
+                continue
+            if natural_pocket_problems(skel, self.cfg):
+                why["natural pocket"] += 1
+                continue
+            if self._plan_ramps(skel):
+                why["ramp plan"] += 1
+                continue
+            return skel
+        raise SkeletonError(f"seed {seed}: no skeleton passed in {self.cfg.max_attempts} attempts "
+                            f"(rejected by {dict(why.most_common())})")
+
+    def _plan_ramps(self, skel: "Skeleton") -> list[str]:
+        skel.ramps, problems = plan_ramps(skel, _pair_mirror(skel.bases), self.cfg)
+        return problems
+
+    def _lay_out(self, skel: "Skeleton") -> None:
+        mirror = _pair_mirror(skel.bases)
+        for i, lay in plan_base_layouts(skel, mirror, self.cfg).items():
+            skel.bases[i].layout = lay
+        size_rooms(skel, mirror, self.cfg)
 
     # ------------------------------------------------------------------ #
     def _assign_levels(self, skel: "Skeleton", seed: int) -> None:
@@ -300,7 +430,7 @@ class SkeletonGenerator:
         mirror = _pair_mirror(bases)
         pts = [(b.x, b.y) for b in bases]
         level = _draw_levels(bases, mirror, self.cfg, seed)
-        skel_edges, dead = _nullify_cross_level_junctions(bases, skel.edges, level, mirror)
+        skel_edges, dead = _nullify_cross_level_junctions(bases, skel.edges, level, mirror, self.cfg)
         edges = _build_constrained_edges(bases, skel_edges, level, pts, mirror,
                                          self.cfg, ignore=dead)
         for i, b in enumerate(bases):
@@ -330,7 +460,7 @@ class SkeletonGenerator:
 
         # 2) natural: offset from main toward center by sampled distance/angle
         ndist, nang = self.priors.sample_natural_offset(rng)
-        ndist = max(ndist, spacing * 1.05)  # ensure natural respects min spacing
+        ndist = max(ndist, spacing * 1.05, self.cfg.natural_min_dist)
         to_c = math.atan2(c[1] - main1[1], c[0] - main1[0])
         nat1 = (main1[0] + ndist * math.cos(to_c + nang),
                 main1[1] + ndist * math.sin(to_c + nang))
@@ -455,29 +585,35 @@ class SkeletonGenerator:
                     edges.append(SkelEdge(x, y, kind, width))
                     edge_set.add((x, y))
 
-        nat_of_main = {0: 2, 1: 3}
         interior = [i for i in range(n) if bases[i].kind in (BaseKind.BASE, BaseKind.ROOM)]
+
+        def clear(a: int, b: int) -> bool:
+            return not _edge_crosses(bases, a, b, self.cfg)
 
         # (1) each MAIN -> its NATURAL, the small fixed choke (mirror handled by add_sym)
         add_sym(0, 2, "natural", width=self.cfg.main_edge_width)
 
-        # (2) each NATURAL's single wider outgoing edge -> nearest interior node
+        # (2) each NATURAL's single wider outgoing edge -> nearest interior node it can reach
+        #     without crossing another node (the nearest overall if none can; validate rejects it)
         if interior:
-            x = min(interior, key=lambda j: _dist(pts[2], pts[j]))
-            w_out = float(rng.uniform(*self.cfg.natural_out_width))
-            w_out = max(w_out, self.cfg.main_edge_width + 0.5)          # wider than main edge
-            w_out = min(w_out, bases[2].width, bases[x].width)          # <= node widths (cap)
+            reach = [j for j in interior if clear(2, j)] or interior
+            x = min(reach, key=lambda j: _dist(pts[2], pts[j]))
+            rng.uniform()                         # keeps every seed's later draws unchanged
+            w_out = self.cfg.natural_out_width
+            for k in {x, mirror_of[x]}:           # the target is never narrower than the choke
+                bases[k].width = max(bases[k].width, w_out)
             add_sym(2, x, "out", width=w_out)
         else:
             add_sym(2, 3, "out")  # degenerate: no interior -> naturals link directly
 
-        # (3) interior network: RNG (=> connected + symmetric) over interior nodes
+        # (3) interior network: RNG (symmetric) over interior nodes, minus any edge that would cross
+        #     another node. Dropping those can split the network, so (3b) rejoins it.
         if len(interior) >= 2:
             inter_pts = [pts[i] for i in interior]
             for ia, ib in _rng_graph(inter_pts):
-                add_sym(interior[ia], interior[ib], "standard")
+                if clear(interior[ia], interior[ib]):
+                    add_sym(interior[ia], interior[ib], "standard")
 
-        # (4) raise every interior node to degree >= 2 (nearest non-adjacent interior)
         def adjacency() -> dict[int, set[int]]:
             adj: dict[int, set[int]] = {i: set() for i in range(n)}
             for e in edges:
@@ -485,13 +621,39 @@ class SkeletonGenerator:
                 adj[e.b].add(e.a)
             return adj
 
+        # (3b) rejoin split interior components (with the natural out-edges hanging off them) by
+        #      the shortest non-crossing interior-interior link between two components
+        for _ in range(n):
+            adj = adjacency()
+            comp: dict[int, int] = {}
+            for s0 in interior:
+                if s0 in comp:
+                    continue
+                stack = [s0]
+                comp[s0] = s0
+                while stack:
+                    u = stack.pop()
+                    for v in adj[u]:
+                        if v not in comp and bases[v].kind in (BaseKind.BASE, BaseKind.ROOM):
+                            comp[v] = s0
+                            stack.append(v)
+            if len(set(comp.values())) <= 1:
+                break
+            links = [(_dist(pts[i], pts[j]), i, j) for i in interior for j in interior
+                     if i < j and comp[i] != comp[j] and clear(i, j)]
+            if not links:
+                break
+            _, i, j = min(links)
+            add_sym(i, j, "standard")
+
+        # (4) raise every interior node to degree >= 2 (nearest non-adjacent, non-crossing interior)
         for _ in range(2 * n):
             adj = adjacency()
             low = [i for i in interior if len(adj[i]) < 2]
             if not low:
                 break
             i = low[0]
-            cand = [j for j in interior if j != i and j not in adj[i]]
+            cand = [j for j in interior if j != i and j not in adj[i] and clear(i, j)]
             if not cand:
                 break
             j = min(cand, key=lambda k: _dist(pts[i], pts[k]))
@@ -537,7 +699,9 @@ class SkeletonGenerator:
             mid = ((bases[a].x + bases[b].x) / 2.0, (bases[a].y + bases[b].y) / 2.0)
             avoid = {a, b, ma, mb}
             cand = [i for i in range(len(bases))
-                    if is_interior(i) and i not in avoid]
+                    if is_interior(i) and i not in avoid
+                    and not _segment_crosses(bases, mid, (bases[i].x, bases[i].y),
+                                             {a, b, i}, self.cfg)]
             if not cand:
                 continue
             x = min(cand, key=lambda i: _dist(mid, (bases[i].x, bases[i].y)))
@@ -585,6 +749,18 @@ class SkeletonGenerator:
 # (moved from generate/rasterize.py: the skeleton now decides tiers and which
 #  edges survive under the ramp rules; the rasterizer just paints the result.)
 # --------------------------------------------------------------------------- #
+_REAL_KINDS = (BaseKind.MAIN, BaseKind.NATURAL, BaseKind.BASE)
+
+
+def _level_banned(bases, i: int, lvl: int, cfg: GenConfig) -> bool:
+    """True if node ``i`` may not sit at ``lvl`` because it would share a nearby main's plateau."""
+    b = bases[i]
+    if b.kind in (BaseKind.MAIN, BaseKind.NATURAL) or lvl != cfg.main_level:
+        return False
+    return any(o.kind == BaseKind.MAIN and math.hypot(o.x - b.x, o.y - b.y) < cfg.main_isolation
+               for o in bases)
+
+
 def _draw_levels(bases, mirror: list[int], cfg: GenConfig, seed: int) -> list[int]:
     """Assign a discrete elevation tier to every node (symmetric across mirror pairs).
 
@@ -614,12 +790,23 @@ def _draw_levels(bases, mirror: list[int], cfg: GenConfig, seed: int) -> list[in
             level[i] = int(round((level[p0] + level[p1]) / 2.0))
         else:  # BASE or ROOM -- distinct per-node tier (keeps the routed single-path look)
             level[i] = int(generic_levels[i])
+            if b.kind == BaseKind.ROOM:
+                # a room hugging a base shares its floor: a flat passage into a base is harmless,
+                # but a level change that close would have to ramp into the base's core
+                near = [(math.hypot(o.x - b.x, o.y - b.y), k) for k, o in enumerate(bases)
+                        if o.kind in _REAL_KINDS]
+                d, k = min(near, default=(math.inf, -1))
+                if d < cfg.base_clearance:
+                    level[i] = level[k]
+        if _level_banned(bases, i, level[i], cfg):
+            level[i] = cfg.natural_level
         done.add(i)
         done.add(mirror[i])
     return level
 
 
-def _nullify_cross_level_junctions(bases, edges, level: list[int], mirror: list[int]):
+def _nullify_cross_level_junctions(bases, edges, level: list[int], mirror: list[int],
+                                   cfg: GenConfig):
     """Remove any JUNCTION that would sit between two DIFFERENT-level parents, together with ALL of
     its incident edges, and let the constrained-edge reconnect stitch the remaining VALID nodes back
     together.
@@ -632,12 +819,29 @@ def _nullify_cross_level_junctions(bases, edges, level: list[int], mirror: list[
     offending junction and its edges; the real nodes it used to route (its two parents and its
     third-branch target) are reconnected downstream by :func:`_build_constrained_edges` using only
     valid same-level / single-step edges among the surviving nodes. Mirror-safe: a junction and its
-    partner are removed together, so symmetry is preserved. Returns ``(surviving_edges, removed)``."""
+    partner are removed together, so symmetry is preserved. Returns ``(surviving_edges, removed)``.
+
+    A junction is KEPT (and re-levelled, with its mirror) when one tier puts every neighbour within
+    one level and changes level on at most one incident edge: it is then an ordinary pad-less node
+    with a single ramp, and its loop survives. Only junctions that would need two ramps are
+    removed."""
+    nbrs: dict[int, set[int]] = {}
+    for e in edges:
+        nbrs.setdefault(e.a, set()).add(e.b)
+        nbrs.setdefault(e.b, set()).add(e.a)
     removed: set[int] = set()
     for i, b in enumerate(bases):
-        if b.kind == BaseKind.JUNCTION and b.parents:
+        if b.kind == BaseKind.JUNCTION and b.parents and i not in removed:
             a, c = b.parents
-            if level[a] != level[c]:
+            if level[a] == level[c]:
+                continue
+            nl = [level[k] for k in nbrs.get(i, ())]
+            fits = [L for L in sorted(set(nl))
+                    if all(abs(v - L) <= 1 for v in nl) and sum(v != L for v in nl) <= 1
+                    and not _level_banned(bases, i, L, cfg)]
+            if fits:
+                level[i] = level[mirror[i]] = fits[0]
+            else:
                 removed.add(i)
                 removed.add(mirror[i])
     if not removed:
@@ -668,6 +872,14 @@ def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=
     fixed = (BaseKind.MAIN, BaseKind.NATURAL)
     ignore = ignore or set()          # nodes removed from the graph (e.g. nullified junctions):
     live = [i for i in range(n) if i not in ignore]  # never counted / bridged during reconnect
+    # the real base each ROOM hugs (same rule as _draw_levels); re-levelling must keep them together
+    hugged = [-1] * n
+    for i, b in enumerate(bases):
+        if b.kind == BaseKind.ROOM:
+            d, k = min(((math.hypot(o.x - b.x, o.y - b.y), k) for k, o in enumerate(bases)
+                        if o.kind in _REAL_KINDS), default=(math.inf, -1))
+            if d < cfg.base_clearance:
+                hugged[i] = k
 
     def pkey(a, b):
         ma, mb = mirror[a], mirror[b]
@@ -680,11 +892,15 @@ def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=
     def dlev(e):
         return abs(level[e.a] - level[e.b])
 
+
+
     def elen(g):
         e = g[0]
         return math.hypot(pts[e.a][0] - pts[e.b][0], pts[e.a][1] - pts[e.b][1])
 
     def ewidth(e):
+        if is_nat_out(bases, e):
+            return cfg.natural_out_width
         return min(max(cfg.min_edge_paint_width, e.width), cfg.ramp_choke_width)
 
     def band(e):
@@ -765,12 +981,20 @@ def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=
                     return True
         return False
 
-    # 1) all same-level passages (diff 0) -- free to touch/merge into open ground
-    for g in groups.values():
-        if dlev(g[0]) == 0:
-            add_group(g, False)
+    def crossing(e, s, lv=None):
+        # two corridors may overlap only when both are flat at the same level (open ground)
+        lv = lv or level
+        if {e.a, e.b} & {s.a, s.b}:
+            return False
+        if lv[e.a] == lv[e.b] == lv[s.a] == lv[s.b]:
+            return False
+        return _seg_seg_dist(pts[e.a], pts[e.b], pts[s.a], pts[s.b]) \
+            < (e.width + s.width) / 2.0 + _touch_margin
 
-    # 2) mandatory main->natural ramps (a main's only exit; add even if it had to touch)
+    def crosses_other_level(g):
+        return any(crossing(e, s) for e in g for s in selected)
+
+    # 1) mandatory main->natural ramps first (a main's only exit), so nothing can claim their space
     def is_main_edge(g):
         e = g[0]
         return BaseKind.MAIN in (bases[e.a].kind, bases[e.b].kind)
@@ -778,6 +1002,12 @@ def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=
     for g in groups.values():
         if dlev(g[0]) == 1 and is_main_edge(g) and pkey(g[0].a, g[0].b) not in added:
             add_group(g, True)
+
+    # 2) same-level passages (diff 0) -- free to touch/merge into open ground of their own level,
+    #    but never across a corridor on another level
+    for g in groups.values():
+        if dlev(g[0]) == 0 and pkey(g[0].a, g[0].b) not in added and not crosses_other_level(g):
+            add_group(g, False)
 
     # 3) ramps (diff 1): add every candidate ramp that doesn't touch an already-placed ramp
     #    (RULE 2). Redundant ramps (both ends already connected) are KEPT -- multiple paths/loops
@@ -790,6 +1020,8 @@ def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=
             continue
         if ramp_would_overload(g):     # 2nd ramp at a pad-less node -> would fuse -> skip
             continue
+        if crosses_other_level(g):
+            continue
         add_group(g, True)
 
     # 4) forced reconnect: if still disconnected, reuse a dropped candidate that bridges two
@@ -798,14 +1030,42 @@ def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=
     def n_components():
         return len({find(i) for i in live})
 
-    def flatten_toward(u, tgt_level):
-        if bases[u].kind in fixed:
+    def flatten_ok(u, tgt_level):
+        # re-levelling u (and its mirror) must keep every already-selected incident edge <= 1 level
+        # and must not turn an allowed same-level overlap into a cross-level crossing
+        if bases[u].kind in fixed or _level_banned(bases, u, tgt_level, cfg):
             return False
+        if any(hugged[k] == u or (k == u and hugged[k] >= 0 and level[hugged[k]] != tgt_level)
+               for k in range(n)):
+            return False
+        moved = {u, mirror[u]}
+        lv = list(level)
+        for k in moved:
+            lv[k] = tgt_level
+        for e in selected:
+            if e.a in moved or e.b in moved:
+                if abs(lv[e.a] - lv[e.b]) > 1:
+                    return False
+                if any(crossing(e, s, lv) for s in selected if s is not e):
+                    return False
+        return True
+
+    def flatten_toward(u, tgt_level):
         if level[u] == tgt_level:
             return True
+        if not flatten_ok(u, tgt_level):
+            return False
         level[u] = tgt_level
         level[mirror[u]] = tgt_level
         return True
+
+    def degree(u):
+        return sum(1 for e in selected if u in (e.a, e.b))
+
+    def may_bridge(u):
+        # a MAIN keeps its single natural edge; a NATURAL only regains a lost out-edge
+        k = bases[u].kind
+        return k != BaseKind.MAIN and (k != BaseKind.NATURAL or degree(u) < 2)
 
     for _ in range(4 * n):
         if n_components() == 1:
@@ -824,35 +1084,59 @@ def _build_constrained_edges(bases, skel_edges, level, pts, mirror, cfg, ignore=
             e = g[0]
             # collapse the gap to a passage where possible (prefer flattening the higher free end
             # down to the lower); if a fixed endpoint blocks it, leave as a (single-step) ramp
+            saved = list(level)
             if dlev(e) >= 1:
                 hi, lo = (e.a, e.b) if level[e.a] > level[e.b] else (e.b, e.a)
                 if not flatten_toward(hi, level[lo]):
                     flatten_toward(lo, level[hi])
+            if dlev(e) > 1 or crosses_other_level(g) \
+                    or (dlev(e) == 1 and (touches(g) or ramp_would_overload(g))):
+                level[:] = saved
+                added.add(pkey(e.a, e.b))           # can't be added legally -> never retry it
+                continue
             add_group(g, dlev(e) == 1)
             continue
-        # no candidate edge left: bridge the two nearest nodes across components directly
+        # no candidate edge left: bridge the nearest cross-component pair that obeys every edge
+        # rule -- degree (may_bridge), no crossing, <= 1 level (flattening only where legal), and,
+        # if it stays a ramp, the same no-touch / no-overload checks as every other ramp
         comps: dict = {}
         for i in live:
             comps.setdefault(find(i), []).append(i)
         roots = list(comps)
-        pair = None
+        cands = []
         for ci in range(len(roots)):
             for cj in range(ci + 1, len(roots)):
                 for i in comps[roots[ci]]:
                     for j in comps[roots[cj]]:
-                        d = math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
-                        if pair is None or d < pair[0]:
-                            pair = (d, i, j)
-        if pair is None:
+                        if may_bridge(i) and may_bridge(j) \
+                                and not _edge_crosses(bases, i, j, cfg, ignore=ignore):
+                            cands.append((math.hypot(pts[i][0] - pts[j][0],
+                                                     pts[i][1] - pts[j][1]), i, j))
+        bridged = False
+        for _, i, j in sorted(cands):
+            saved = list(level)
+            if not flatten_toward(j, level[i]):
+                flatten_toward(i, level[j])
+            dl = abs(level[i] - level[j])
+            nat = BaseKind.NATURAL in (bases[i].kind, bases[j].kind)
+            width = cfg.natural_out_width if nat else \
+                min(cfg.min_edge_paint_width, bases[i].width, bases[j].width)
+            ne = [SkelEdge(min(i, j), max(i, j), "repair", width)]
+            mi, mj = mirror[i], mirror[j]
+            if {mi, mj} != {i, j}:
+                ne.append(SkelEdge(min(mi, mj), max(mi, mj), "repair", width))
+            if dl > 1 or crosses_other_level(ne) \
+                    or (dl == 1 and (touches(ne) or ramp_would_overload(ne))):
+                level[:] = saved
+                continue
+            add_group(ne, dl == 1)
+            if nat:
+                for k in {i, j, mi, mj}:
+                    bases[k].width = max(bases[k].width, width)
+            bridged = True
             break
-        _, i, j = pair
-        if not flatten_toward(j, level[i]):
-            flatten_toward(i, level[j])
-        ne = [SkelEdge(min(i, j), max(i, j), "repair", cfg.min_edge_paint_width)]
-        mi, mj = mirror[i], mirror[j]
-        if {mi, mj} != {i, j}:
-            ne.append(SkelEdge(min(mi, mj), max(mi, mj), "repair", cfg.min_edge_paint_width))
-        add_group(ne, abs(level[i] - level[j]) == 1)
+        if not bridged:
+            break
 
     return selected
 
@@ -878,7 +1162,8 @@ def _connected(n: int, edges: list[SkelEdge]) -> bool:
     return len(seen) == n
 
 
-def validate(skel: Skeleton, min_spacing_tol: float = 0.85) -> tuple[bool, list[str]]:
+def validate(skel: Skeleton, min_spacing_tol: float = 0.85,
+             cfg: GenConfig | None = None) -> tuple[bool, list[str]]:
     issues: list[str] = []
     bases = skel.bases
     c = skel.center()
@@ -998,12 +1283,34 @@ def validate(skel: Skeleton, min_spacing_tol: float = 0.85) -> tuple[bool, list[
                 issues.append(
                     f"edge {e.a}-{e.b} spans {abs(bases[e.a].level - bases[e.b].level)} levels > 1")
                 break
+        # corridors may only overlap when both are flat on the same level
+        lv = [b.level for b in bases]
+        es = skel.edges
+        crossed = next(((e, s) for k, e in enumerate(es) for s in es[k + 1:]
+                        if not {e.a, e.b} & {s.a, s.b}
+                        and not lv[e.a] == lv[e.b] == lv[s.a] == lv[s.b]
+                        and _seg_seg_dist(pts[e.a], pts[e.b], pts[s.a], pts[s.b])
+                        < (e.width + s.width) / 2.0 + 2.0), None)
+        if crossed:
+            e, s = crossed
+            issues.append(f"edges {e.a}-{e.b} and {s.a}-{s.b} cross on different levels")
 
-    # width hierarchy: no edge is wider than either endpoint node
+    # no edge may cut through a node it doesn't connect (degree-0 dead junctions don't count)
+    unlinked = {i for i, b in enumerate(bases) if b.kind == BaseKind.JUNCTION and not adj[i]}
+    for e in skel.edges:
+        if _edge_crosses(bases, e.a, e.b, cfg or GenConfig(), ignore=unlinked):
+            issues.append(f"edge {e.a}-{e.b} crosses another node")
+            break
+
+    # width hierarchy: min_edge_width <= edge width <= the narrower endpoint node
+    min_w = (cfg or GenConfig()).min_edge_width
     for e in skel.edges:
         cap = min(bases[e.a].width, bases[e.b].width)
         if e.width > cap + 1e-6:
             issues.append(f"edge {e.a}-{e.b} width {e.width:.1f} > node cap {cap:.1f}")
+            break
+        if e.width < min(min_w, cap) - 1e-6:
+            issues.append(f"edge {e.a}-{e.b} width {e.width:.1f} < min edge width {min_w:.1f}")
             break
 
     # edge symmetry

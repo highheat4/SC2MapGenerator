@@ -46,9 +46,11 @@ template's asset cache (§2).
 from sc2mapgen.export import sc2map
 from sc2mapgen.export.exporter import (
     ExportConfig,
+    TemplateFitError,
     export_sc2map,
     pick_template,
     verify_export,
 )
 
-__all__ = ["ExportConfig", "export_sc2map", "pick_template", "verify_export", "sc2map"]
+__all__ = ["ExportConfig", "TemplateFitError", "export_sc2map", "pick_template", "verify_export",
+           "sc2map"]

@@ -14,6 +14,13 @@ Color scheme:
     light-blue  = mineral fields
     green       = geysers
     magenta     = destructibles
+
+With a generator skeleton overlay:
+    purple square    = ROOM (label = level)
+    magenta triangle = JUNCTION (label = level)
+    grey cross       = JUNCTION dropped for spanning two levels
+    white line       = same-level skeleton edge
+    cyan dashed line = level-change skeleton edge
 """
 
 from __future__ import annotations
@@ -29,7 +36,44 @@ import numpy as np
 from sc2mapgen.ir import BaseKind, MapIR, ResourceKind
 
 
-def render(mapir: MapIR, out_path: str | Path) -> Path:
+def _draw_skeleton(ax, skel) -> dict[str, int]:
+    """Overlay the generator's skeleton graph: every node by kind, and every edge (solid = same
+    level, dashed = level change). Junctions nullified for spanning two levels have no edges and
+    are drawn as grey crosses. Returns node counts by kind."""
+    bases = skel.bases
+    deg = [0] * len(bases)
+    for e in skel.edges:
+        deg[e.a] += 1
+        deg[e.b] += 1
+        a, b = bases[e.a], bases[e.b]
+        cross = getattr(a, "level", 0) != getattr(b, "level", 0)
+        ax.plot([a.x, b.x], [a.y, b.y], "--" if cross else "-",
+                color="#00e5ff" if cross else "white", lw=1.3, alpha=0.9, zorder=5)
+    counts = {"ROOM": 0, "JUNCTION": 0, "dead JUNCTION": 0}
+    for i, b in enumerate(bases):
+        if b.kind == BaseKind.ROOM:
+            counts["ROOM"] += 1
+            ax.scatter([b.x], [b.y], s=110, c="#8a2be2", marker="s", edgecolors="white",
+                       linewidths=1.2, zorder=6)
+        elif b.kind == BaseKind.JUNCTION:
+            if deg[i] == 0:
+                counts["dead JUNCTION"] += 1
+                ax.scatter([b.x], [b.y], s=90, c="#9a9a9a", marker="X", zorder=6)
+            else:
+                counts["JUNCTION"] += 1
+                ax.scatter([b.x], [b.y], s=150, c="#ff2fd0", marker="^", edgecolors="white",
+                           linewidths=1.2, zorder=6)
+        if b.kind in (BaseKind.ROOM, BaseKind.JUNCTION):
+            ax.annotate(str(getattr(b, "level", "")), (b.x, b.y), color="white", fontsize=7,
+                        ha="center", va="center", zorder=7)
+    return counts
+
+
+def render(mapir: MapIR, out_path: str | Path, skeleton=None, subtitle: str = "",
+           overlay: bool = True) -> Path:
+    """Render ``mapir``; pass the generator ``skeleton`` to overlay its node/edge graph instead of
+    the ingest-inferred region graph. ``overlay=False`` draws neither: terrain, ramps, resources,
+    bases and start locations only."""
     walkable = mapir.walkable
     elevation = mapir.elevation.astype(float)
 
@@ -55,7 +99,7 @@ def render(mapir: MapIR, out_path: str | Path) -> Path:
     # infer non-base nodes from where ramps lead (exits not pointing at a nearby base)
     from sc2mapgen.ingest.graph import detect_nonbase_nodes
 
-    nonbase_nodes = detect_nonbase_nodes(
+    nonbase_nodes = [] if skeleton is not None or not overlay else detect_nonbase_nodes(
         [(b.x, b.y) for b in mapir.bases],
         mapir.ramps,
         walkable,
@@ -69,12 +113,13 @@ def render(mapir: MapIR, out_path: str | Path) -> Path:
 
     # region/connection graph overlay: region centroids + ramp connections as edges
     region_centroid = {rg.id: rg.centroid for rg in mapir.regions}
-    for conn in mapir.connections:
+    region_graph = overlay and skeleton is None
+    for conn in (mapir.connections if region_graph else []):
         a = region_centroid.get(conn.source_region)
         b = region_centroid.get(conn.target_region)
         if a and b:
             ax.plot([a[0], b[0]], [a[1], b[1]], "-", color="#ff2fd0", lw=1.2, alpha=0.8, zorder=3)
-    if mapir.regions:
+    if mapir.regions and region_graph:
         rx = [rg.centroid[0] for rg in mapir.regions]
         ry = [rg.centroid[1] for rg in mapir.regions]
         ax.scatter(rx, ry, c="#ff2fd0", s=22, marker="D", edgecolors="black", linewidths=0.4, zorder=4)
@@ -110,15 +155,24 @@ def render(mapir: MapIR, out_path: str | Path) -> Path:
         color, size = base_style[b.kind]
         ax.scatter([b.x], [b.y], s=size, facecolors="none", edgecolors=color, linewidths=2.0)
 
+    skel_counts = _draw_skeleton(ax, skeleton) if skeleton is not None and overlay else None
+
     # start locations
     if mapir.start_locations:
         sx, sy = zip(*mapir.start_locations)
         ax.scatter(sx, sy, c="white", s=40, marker="P", edgecolors="black", linewidths=0.5)
 
+    if not overlay:
+        nodes = ""
+    elif skel_counts is None:
+        nodes = f"{len(nonbase_nodes)} non-base nodes"
+    else:
+        nodes = (f"{skel_counts['ROOM']} rooms, {skel_counts['JUNCTION']} junctions"
+                 + (f" (+{skel_counts['dead JUNCTION']} dropped)"
+                    if skel_counts['dead JUNCTION'] else ""))
     ax.set_title(
-        f"{mapir.map_name}  ({mapir.width}x{mapir.height}, "
-        f"{len(mapir.bases)} bases, {len(mapir.ramps)} ramps, "
-        f"{len(nonbase_nodes)} non-base nodes)"
+        f"{mapir.map_name}  {subtitle}\n({mapir.width}x{mapir.height}, "
+        f"{len(mapir.bases)} bases, {len(mapir.ramps)} ramps{', ' + nodes if nodes else ''})"
     )
     ax.set_xlim(-1, w)
     ax.set_ylim(-1, h)

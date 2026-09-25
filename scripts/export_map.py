@@ -20,8 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from sc2mapgen.export import ExportConfig, export_sc2map  # noqa: E402
 from sc2mapgen.export.exporter import verify_export  # noqa: E402
-from sc2mapgen.generate.rasterize import RasterConfig, rasterize  # noqa: E402
-from sc2mapgen.generate.skeleton import SYMMETRIES, GenConfig, SkeletonGenerator  # noqa: E402
+from sc2mapgen.generate.rasterize import RasterConfig, RasterizeError, rasterize  # noqa: E402
+from sc2mapgen.generate.skeleton import (  # noqa: E402
+    SYMMETRIES, GenConfig, SkeletonError, SkeletonGenerator,
+)
 from sc2mapgen.generate.validate import validate_map  # noqa: E402
 
 OUT = Path("outputs/export")
@@ -60,7 +62,11 @@ def main() -> None:
         while len(seeds) < args.count and attempts < args.max_attempts:
             s = args.seed + attempts
             attempts += 1
-            mapir = rasterize(gen.generate(s), seed=s, cfg=rcfg)
+            try:
+                mapir = rasterize(gen.generate(s), seed=s, cfg=rcfg)
+            except (SkeletonError, RasterizeError) as exc:
+                print(f"[m7] seed={s}: no map ({exc})")
+                continue
             if validate_map(mapir).ok:
                 seeds.append(s)
         print(f"[m7] --valid-only: found {len(seeds)}/{args.count} traversable map(s) "
@@ -70,7 +76,11 @@ def main() -> None:
 
     exported_ok = valid_ok = 0
     for seed in seeds:
-        mapir = rasterize(gen.generate(seed), seed=seed, cfg=rcfg)
+        try:
+            mapir = rasterize(gen.generate(seed), seed=seed, cfg=rcfg)
+        except (SkeletonError, RasterizeError) as exc:
+            print(f"[m7] seed={seed}: no map ({exc})")
+            continue
         rep = validate_map(mapir)
         valid_ok += rep.ok
 

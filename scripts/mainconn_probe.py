@@ -22,13 +22,14 @@ def main() -> None:
 
     import os
     cfg = RasterConfig()
+    gcfg = GenConfig(symmetries=("rot180",))
     if os.environ.get("RAMP_RUN"):
         lo, hi = (float(x) for x in os.environ["RAMP_RUN"].split(","))
-        cfg.ramp_run_range = (lo, hi)
+        gcfg.ramp_run_range = (lo, hi)
     if os.environ.get("RAMP_CHOKE"):
         lo, hi = (float(x) for x in os.environ["RAMP_CHOKE"].split(","))
-        cfg.ramp_choke_range = (lo, hi)
-    g = SkeletonGenerator(config=GenConfig(symmetries=("rot180",)))
+        gcfg.ramp_width_range = (lo, hi)
+    g = SkeletonGenerator(config=gcfg)
     mapir = rasterize(g.generate(SEED), seed=SEED, cfg=cfg)
     info = export_sc2map(mapir, f"outputs/export/{NAME}.SC2Map", ExportConfig(author_ramps=True))
     ox, oy = info["offset"]
@@ -51,18 +52,21 @@ def main() -> None:
 
     class P(BotAI):
         async def on_start(self):
-            # SOURCE must be a PATHABLE cell: the raw MAIN1 center is often a townhall/cliff cell,
-            # and query_pathing from a non-pathable source returns None for EVERY target (a false
-            # all-unreachable). Snap to the nearest pathable cell (pathing_grid[y,x] > 0).
+            # Every base centre is a standardized townhall cell inside the immutable, buildable
+            # base core, so it is probed exactly. The one exception is a MAIN, whose centre is
+            # covered by the start townhall the engine places there (pathing 0): its query point
+            # is the first pathable cell just outside that 5x5 footprint, still inside the core.
             pg = self.game_info.pathing_grid.data_numpy
-            sx, sy, bd = m1[1], m1[2], 1 << 30
-            for dx in range(-10, 11):
-                for dy in range(-10, 11):
-                    x, y = m1[1] + dx, m1[2] + dy
-                    if 0 <= y < pg.shape[0] and 0 <= x < pg.shape[1] and pg[y, x] > 0:
-                        d = dx * dx + dy * dy
-                        if d < bd:
-                            bd, sx, sy = d, x, y
+
+            def query_cell(kind, x, y):
+                if kind != "MAIN":
+                    return x, y
+                for dx, dy in ((0, -3), (0, 3), (-3, 0), (3, 0)):
+                    if pg[y + dy, x + dx] > 0:
+                        return x + dx, y + dy
+                return x, y
+
+            sx, sy = query_cell(*m1)
             src = Point2((sx + 0.5, sy + 0.5))
             print(f"MAP_RAMPS_DETECTED={len(self.game_info.map_ramps)} src=({sx},{sy})")
 
@@ -78,35 +82,27 @@ def main() -> None:
                     ix, iy = int(rx), int(ry)
                     if 0 <= iy < pass_.shape[0] and 0 <= ix < pass_.shape[1]:
                         pass_[iy, ix] = True
+            # the start townhalls are units, not terrain: open their footprints for the flood
+            for kind, x, y in bases:
+                if kind == "MAIN":
+                    pass_[y - 2:y + 3, x - 2:x + 3] = True
             lbl, _ = _ndi.label(pass_)
 
             def _pcomp(x, y):
-                bestc = 0
-                for dx in range(-3, 4):
-                    for dy in range(-3, 4):
-                        yy, xx = y + dy, x + dx
-                        if 0 <= yy < lbl.shape[0] and 0 <= xx < lbl.shape[1] and lbl[yy, xx] > 0:
-                            return int(lbl[yy, xx])
-                return bestc
+                return int(lbl[y, x])
             mc = _pcomp(m1[1], m1[2])
             print(f"PATHGRID_CONN main1_comp={mc}")
             for kind, x, y in bases:
                 bc = _pcomp(x, y)
                 print(f"  [grid] MAIN1 ~ {kind:8} ({x},{y}) comp={bc} SAME={bc == mc and bc > 0}")
             for kind, x, y in bases:
-                # Query a small ring around the base center, not just the center: the exact
-                # townhall cell is often non-pathable, giving a FALSE 'unreachable' even though the
-                # base is connected (verified: unit walked there anyway). REACH iff ANY nearby
-                # cell is reachable.
-                best = None
-                for dx in (0, -4, 4, -6, 6):
-                    for dy in (0, -4, 4, -6, 6):
-                        d = await self.client.query_pathing(src, Point2((x + dx + 0.5, y + dy + 0.5)))
-                        if d is not None and (best is None or d < best):
-                            best = d
-                same = abs(x - m1[1]) < 2 and abs(y - m1[2]) < 2
-                print(f"  MAIN1 -> {kind:8} ({x},{y}) dist={None if best is None else round(best, 1)} "
-                      f"REACH={best is not None or same}{' (self)' if same else ''}")
+                qx, qy = query_cell(kind, x, y)
+                same = (qx, qy) == (sx, sy)
+                d = None if same else await self.client.query_pathing(
+                    src, Point2((qx + 0.5, qy + 0.5)))
+                print(f"  MAIN1 -> {kind:8} ({x},{y}) q=({qx},{qy}) "
+                      f"pg={int(pg[qy, qx])} dist={None if d is None else round(d, 1)} "
+                      f"REACH={d is not None or same}{' (self)' if same else ''}")
             await self.client.leave()
 
         async def on_step(self, it):

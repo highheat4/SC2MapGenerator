@@ -30,7 +30,8 @@ import numpy as np
 from scipy import ndimage
 
 from sc2mapgen.generate.rasterize import (
-    cardinal_ramp_bridge, engine_cliff_grid, engine_components, validate_base_pads, validate_ramps,
+    cardinal_ramp_bridge, engine_cliff_grid, engine_components, geyser_cells, mineral_cells,
+    townhall_cells, validate_base_pads, validate_ramps,
 )
 from sc2mapgen.ir import BaseKind, MapIR, ResourceKind
 
@@ -293,26 +294,34 @@ def _check_resources(mapir: MapIR, elev, walk, cfg: ValidateConfig) -> list[str]
             continue
         mins = geys = 0
         floor = int(elev[_cell(b)[1], _cell(b)[0]])
+        th = townhall_cells(*_cell(b))
+        if not all(in_playable(x, y) and mapir.buildable[y, x] and int(elev[y, x]) == floor
+                   for x, y in th):
+            fails.append(f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) townhall footprint not buildable")
         for ri in b.resource_idx:
             r = mapir.resources[ri]
-            ix, iy = int(round(r.x)), int(round(r.y))
             if r.kind == ResourceKind.MINERAL:
                 mins += 1
+                cells = mineral_cells(r.x, r.y)
             elif r.kind == ResourceKind.GEYSER:
                 geys += 1
-            if not in_playable(ix, iy):
-                fails.append(f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) resource off playable area")
-            elif ramp_mask[iy, ix]:
-                fails.append(f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) resource on a ramp")
-            elif int(elev[iy, ix]) != floor:
-                fails.append(
-                    f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) resource on floor "
-                    f"{int(elev[iy, ix])} != base floor {floor}"
-                )
-            key = (ix, iy)
-            if key in seen:
-                fails.append(f"resource overlap at ({ix},{iy})")
-            seen[key] = ri
+                cells = geyser_cells(r.x, r.y)
+            else:
+                continue
+            for ix, iy in cells:
+                if not in_playable(ix, iy):
+                    fails.append(f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) resource off playable area")
+                elif ramp_mask[iy, ix]:
+                    fails.append(f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) resource on a ramp")
+                elif int(elev[iy, ix]) != floor:
+                    fails.append(
+                        f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) resource on floor "
+                        f"{int(elev[iy, ix])} != base floor {floor}"
+                    )
+                key = (ix, iy)
+                if key in seen:
+                    fails.append(f"resource overlap at ({ix},{iy})")
+                seen[key] = ri
         if mins != cfg.expect_minerals:
             fails.append(
                 f"{b.kind.value} @({b.x:.0f},{b.y:.0f}) has {mins} minerals "

@@ -234,7 +234,18 @@ class Ramp:
     bottom: tuple[float, float] | None = None
     low_level: int | None = None
     high_level: int | None = None
-    width: float | None = None  # approx tiles across (size / length)
+    width: float | None = None  # approx tiles across (size / length); the planned width if generated
+    # SC2 ``dir`` (index into RAMP_DIR_U) the ramp climbs along. Set from the plan for generated
+    # maps; None for ingested ramps, whose direction is snapped from ``bottom -> top``.
+    direction: int | None = None
+
+
+def ramp_uphill(r: Ramp) -> tuple[int, tuple[float, float]]:
+    """``(dir, unit uphill vector)`` a ramp is authored along: the planned direction when there is
+    one, else the low->high plateau-centroid vector snapped to the 8 ramp directions."""
+    if r.direction is not None:
+        return r.direction, RAMP_DIR_U[r.direction]
+    return snap_uphill(r.top[0] - r.bottom[0], r.top[1] - r.bottom[1])
 
 
 @dataclass
@@ -365,6 +376,7 @@ class MapIR:
                     "low_level": r.low_level,
                     "high_level": r.high_level,
                     "width": r.width,
+                    "direction": r.direction,
                 }
                 for r in self.ramps
             ],

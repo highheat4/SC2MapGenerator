@@ -14,8 +14,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from sc2mapgen.generate.rasterize import RasterConfig, rasterize  # noqa: E402
-from sc2mapgen.generate.skeleton import GenConfig, SkeletonGenerator  # noqa: E402
+from sc2mapgen.generate.rasterize import RasterConfig, RasterizeError, rasterize  # noqa: E402
+from sc2mapgen.generate.skeleton import GenConfig, SkeletonError, SkeletonGenerator  # noqa: E402
 from sc2mapgen.ir import ResourceKind  # noqa: E402
 
 OFFSETS = [(x, y) for x, y in itertools.product(range(-7, 8), repeat=2) if 4 < math.hypot(x, y) <= 8]
@@ -27,8 +27,9 @@ def check(mapir) -> tuple[int, int, list[str]]:
     h, w = place.shape
 
     def hgt(x, y):
+        # terrain_height units: ~16 per cliff level (findings §2b), so different levels never merge
         xi, yi = int(round(x)), int(round(y))
-        return int(elev[yi, xi]) if 0 <= xi < w and 0 <= yi < h else -99
+        return 16 * int(elev[yi, xi]) if 0 <= xi < w and 0 <= yi < h else -99
 
     def buildable(x, y):
         xi, yi = int(round(x)), int(round(y))
@@ -80,7 +81,11 @@ def main() -> None:
     tot_clusters = tot_fails = clean_maps = 0
     for i in range(args.count):
         seed = args.seed + i
-        mapir = rasterize(gen.generate(seed), seed=seed, cfg=rcfg)
+        try:
+            mapir = rasterize(gen.generate(seed), seed=seed, cfg=rcfg)
+        except (SkeletonError, RasterizeError) as exc:
+            print(f"-- seed={seed}: no map ({exc})")
+            continue
         nc, nf, fails = check(mapir)
         tot_clusters += nc
         tot_fails += nf

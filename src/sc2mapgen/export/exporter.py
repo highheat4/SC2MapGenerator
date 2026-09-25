@@ -85,43 +85,70 @@ def _heal_flat_terrain(tiers: np.ndarray, tiers_intended: np.ndarray,
     return out, ti
 
 
-def _template_dims(path: str) -> tuple[int, int, int, int] | None:
-    """(grid_w, grid_h, playable_w, playable_h) of a template, or None if unreadable."""
+def _template_dims(path: str) -> tuple[int, int, int, int, int] | None:
+    """(grid_w, grid_h, playable_w, playable_h, palette_tiers) of a template, or None if
+    unreadable. ``palette_tiers`` is 0 when the template has no flat void to harvest."""
     try:
         a = MPQArchive(path)
-        _, cw, ch, _ = sc2map.decode_cliff(a.read_file("t3SyncCliffLevel"))
+        _, cw, ch, cl = sc2map.decode_cliff(a.read_file("t3SyncCliffLevel"))
         mi = a.read_file("MapInfo")
         off, _, _ = sc2map._mapinfo_playable_offset(mi)
         l, b, r, t = struct.unpack_from("<4i", mi, off)
-        return cw, ch, r - l, t - b
+        return cw, ch, r - l, t - b, sc2map.palette_capacity(cl)
     except Exception:
         return None
 
 
-def pick_template(mapir: MapIR, templates_dir: str = _TEMPLATES_DIR) -> str:
-    """Choose the smallest real map whose grid holds our map AND whose *playable area* covers
-    our playable content, so bases never land in the template's void (unplayable == unbuildable)
-    and we don't have to rewrite MapInfo (which SC2 rejects). Falls back to the largest playable.
+class TemplateFitError(RuntimeError):
+    """No template's playable area can hold the map's walkable content."""
+
+
+def content_bbox(mapir: MapIR) -> tuple[int, int, int, int]:
+    """``(x0, y0, x1, y1)`` (end-exclusive) of the walkable cells. The IR grid pads the playable
+    area with void on every side, so this, not the grid, is what a template must hold."""
+    ys, xs = np.nonzero(mapir.walkable)
+    if not xs.size:
+        return 0, 0, mapir.width, mapir.height
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def required_tiers(mapir: MapIR, author_ramps: bool) -> int:
+    """Flat tiers the template palette must supply: one when flattened, else every level used."""
+    if not author_ramps or not mapir.walkable.any():
+        return 1
+    return int(mapir.elevation[mapir.walkable].max()) + 1
+
+
+def pick_template(mapir: MapIR, templates_dir: str = _TEMPLATES_DIR, n_tiers: int = 1) -> str:
+    """Choose the smallest real map whose *playable area* holds our walkable content, so bases
+    never land in the template's unplayable border (unbuildable) and we
+    don't have to rewrite MapInfo (which SC2 rejects). Raises :class:`TemplateFitError` if none
+    does: a clipped export would leave edge bases outside the playable area.
+
+    Only templates whose palette is harvestable with at least ``n_tiers`` flat tiers are
+    considered: many (``Flat*``, ``LastFantasyAIE``, ``SiteDelta*``, ...) contain no void at all.
     """
-    w, h = mapir.width, mapir.height
-    pw, ph = mapir.playable_area.width, mapir.playable_area.height
+    x0, y0, x1, y1 = content_bbox(mapir)
+    pw, ph = x1 - x0, y1 - y0
     fits: list[tuple[int, str]] = []
-    fallback: tuple[int, str] | None = None
+    usable = False
     for path in sorted(glob.glob(str(Path(templates_dir) / "*.SC2Map"))):
         dims = _template_dims(path)
         if dims is None:
             continue
-        cw, ch, plw, plh = dims
-        play_area = plw * plh
-        if fallback is None or play_area > fallback[0]:
-            fallback = (play_area, path)
-        if cw >= w and ch >= h and plw >= pw + 2 and plh >= ph + 2:
+        cw, ch, plw, plh, cap = dims
+        if cap < n_tiers:
+            continue
+        usable = True
+        if plw >= pw and plh >= ph:
             fits.append((cw * ch, path))
     if fits:
         return min(fits)[1]
-    if fallback is None:
-        raise RuntimeError(f"no usable .SC2Map templates in {templates_dir!r}")
-    return fallback[1]
+    if not usable:
+        raise RuntimeError(f"no usable .SC2Map templates in {templates_dir!r} "
+                           f"(need a flat void and {n_tiers} flat tier(s))")
+    raise TemplateFitError(f"walkable content {pw}x{ph} exceeds every template's playable area "
+                           f"({n_tiers} tier(s)) in {templates_dir!r}")
 
 
 def export_sc2map(mapir: MapIR, out_path: str | Path,
@@ -130,7 +157,8 @@ def export_sc2map(mapir: MapIR, out_path: str | Path,
     cfg = cfg or ExportConfig()
     if cfg.author_ramps:
         cfg.flatten_terrain = False   # real relief needs the un-flattened tier grid
-    template = cfg.template or pick_template(mapir, cfg.templates_dir)
+    n_needed = required_tiers(mapir, cfg.author_ramps)
+    template = cfg.template or pick_template(mapir, cfg.templates_dir, n_needed)
 
     arch = MPQArchive(template)
     names = {(n.decode() if isinstance(n, bytes) else n) for n in arch.files}
@@ -141,17 +169,19 @@ def export_sc2map(mapir: MapIR, out_path: str | Path,
 
     # harvest engine-valid flat encodings (cliff/smap/hmap) per terrain tier from the template
     palette = sc2map.harvest_palette(cliff_blob, tmpl_smap, tmpl_hmap)
+    if palette.n_tiers < n_needed:
+        raise ValueError(f"template {Path(template).name} has {palette.n_tiers} flat tier(s); "
+                         f"map needs {n_needed}")
 
-    # centre OUR playable content inside the template's playable region (not the whole grid), so
-    # every base lands on playable ground; clamp so the full IR grid still sits in the template.
+    # centre our walkable content inside the template's playable region (not the whole grid), so
+    # every base lands on playable ground. The IR's void padding may overhang the template grid;
+    # every layer builder crops it.
     tmpl_mapinfo = arch.read_file("MapInfo")
     _poff, _, _ = sc2map._mapinfo_playable_offset(tmpl_mapinfo)
     pl, pb, pr, pt = struct.unpack_from("<4i", tmpl_mapinfo, _poff)
-    pa = mapir.playable_area
-    off_x = int(round((pl + pr) / 2 - (pa.x + pa.width / 2)))
-    off_y = int(round((pb + pt) / 2 - (pa.y + pa.height / 2)))
-    off_x = max(0, min(cw - mapir.width, off_x))
-    off_y = max(0, min(ch - mapir.height, off_y))
+    x0, y0, x1, y1 = content_bbox(mapir)
+    off_x = int(round((pl + pr) / 2 - (x0 + x1) / 2))
+    off_y = int(round((pb + pt) / 2 - (y0 + y1) / 2))
 
     # one tier-index grid drives all three consistently authored terrain layers. Plateaus map to
     # the flat tier cliffs; ramps get overlaid with sub-level gradients so cross-level transitions
@@ -165,8 +195,8 @@ def export_sc2map(mapir: MapIR, out_path: str | Path,
     n_ramps = 0 if cfg.flatten_terrain else \
         sc2map.author_ramp_cliffs(cliff, tiers, mapir.ramps, palette, off_x, off_y)
     if not cfg.flatten_terrain:
-        # channel every ramp: wall the flank plateaus that mismatch the gradient by >8 (so ramps
-        # are crossable only at their lo/hi ends, like FrostLE) -- see findings doc S4.4.
+        # low-plateau flanks stay plateau (gold); only high plateau wrapped around a sub-level
+        # below the top is voided -- see findings doc §4.
         ramp_mask = sc2map.ramp_cell_mask(mapir, cw, ch, off_x, off_y)
         sc2map.channel_ramp_flanks(cliff, ramp_mask)
     height_ramp_mask = None if cfg.flatten_terrain else ramp_mask
@@ -227,6 +257,26 @@ def export_sc2map(mapir: MapIR, out_path: str | Path,
             arch.read_file("t3TextureMasks"), class_grid)
     except Exception:  # noqa: BLE001 -- non-fatal cosmetic step
         pass
+
+    # the minimap background is a baked image; without this it keeps the template's terrain
+    minimap_authored = None
+    if "Minimap.tga" in names:
+        mm_blob = arch.read_file("Minimap.tga")
+        playable = (pl, pb, pr, pt)
+        try:
+            replacements["Minimap.tga"] = sc2map.author_minimap_textured(
+                mm_blob, sc2map.decode_cliff(cliff_blob)[3],
+                sc2map.decode_texture_mask(arch.read_file("t3TextureMasks")),
+                cliff, class_grid, playable)
+            minimap_authored = "textured"
+        except Exception:  # noqa: BLE001 -- fall back to the preview-coloured minimap
+            try:
+                replacements["Minimap.tga"] = sc2map.author_minimap(
+                    mm_blob, cliff > 0, tiers_intended,
+                    sc2map.ramp_slope_mask(mapir, cw, ch, off_x, off_y), playable)
+                minimap_authored = "flat"
+            except Exception:  # noqa: BLE001 -- non-fatal cosmetic step
+                pass
     smap_authored = True
 
     # rename the map away from the template's name (§7/§12): the displayed name is the localized
@@ -278,6 +328,7 @@ def export_sc2map(mapir: MapIR, out_path: str | Path,
         "backend": backend,
         "heightmap_authored": smap_authored,
         "map_renamed": map_renamed,
+        "minimap_authored": minimap_authored,
         "map_name": (cfg.map_name or mapir.map_name) if cfg.rename_map else None,
         "n_tiers": palette.n_tiers,
         "n_ramps_authored": n_ramps,

@@ -3,6 +3,7 @@
     python scripts/rasterize_skeleton.py --seed 7
     python scripts/rasterize_skeleton.py --count 8 --weirdness 0.4
     python scripts/rasterize_skeleton.py --count 8 --features outputs/_features_test.json
+    python scripts/rasterize_skeleton.py --count 100 --no-overlay
 
 Emits (per seed) in outputs/rasters/gen_<seed>/:
     terrain.npy / map.json   (a real MapIR - same type as ingested maps)
@@ -19,12 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.image as mpimg
-import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
 from sc2mapgen.features import extract_features
 from sc2mapgen.generate.plausibility import PlausibilityConfig, PlausibilityModel
@@ -68,20 +65,23 @@ def enrich_graph(mapir) -> None:
 
 
 
-def contact_sheet(pngs, out) -> None:
+def contact_sheet(pngs, out, cols: int = 10, gap: int = 12) -> None:
+    """Tile the previews at their native resolution. Pasting pixels instead of redrawing them
+    through a figure keeps every tile as sharp as its own preview.png when zoomed in."""
     if not pngs:
         return
-    cols = min(4, len(pngs))
-    rows = (len(pngs) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.4, rows * 3.6))
-    axes = axes.ravel() if hasattr(axes, "ravel") else [axes]
-    for ax in axes:
-        ax.axis("off")
-    for ax, p in zip(axes, pngs):
-        ax.imshow(mpimg.imread(p))
-    fig.tight_layout()
-    fig.savefig(out, dpi=95)
-    plt.close(fig)
+    tiles = [Image.open(p).convert("RGB") for p in pngs]
+    tw = max(t.width for t in tiles)
+    th = max(t.height for t in tiles)
+    cols = min(cols, len(tiles))
+    rows = (len(tiles) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * tw + (cols + 1) * gap, rows * th + (rows + 1) * gap), "white")
+    for i, t in enumerate(tiles):
+        r, c = divmod(i, cols)
+        x = gap + c * (tw + gap) + (tw - t.width) // 2
+        y = gap + r * (th + gap) + (th - t.height) // 2
+        sheet.paste(t, (x, y))
+    sheet.save(out, optimize=True)
 
 
 def main() -> None:
@@ -96,6 +96,8 @@ def main() -> None:
     ap.add_argument("--symmetry", default="rot180",
                     choices=[*SYMMETRIES, "mixed"],
                     help="map symmetry: rot180 | mirror_lr | mirror_ud | mixed (all)")
+    ap.add_argument("--no-overlay", action="store_true",
+                    help="preview terrain, ramps, bases and resources only (no skeleton graph)")
     args = ap.parse_args()
 
     priors = load_priors(args.features, args.weirdness)
@@ -121,9 +123,11 @@ def main() -> None:
         enrich_graph(mapir)
         out_dir = OUT / mapir.map_name
         mapir.save(out_dir)
-        pngs.append(render(mapir, out_dir / "preview.png"))
 
         rep = validate_map(mapir)                       # Milestone 5 validator
+        pngs.append(render(mapir, out_dir / "preview.png", skeleton=skel,
+                           subtitle="VALID" if rep.ok else "INVALID",
+                           overlay=not args.no_overlay))
         m = rep.metrics
         valid_ok += rep.ok
         mains_ok += bool(m.get("mains_connected"))
